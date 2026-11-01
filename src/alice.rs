@@ -653,6 +653,28 @@ pub fn intent(text: &str, keyword_only: bool) -> Option<Intent> {
     intent_core(text, keyword_only)
 }
 
+/// Описательный запрос без конкретного исполнителя/жанра: «включи хорошую/весёлую
+/// музыку», «включи что-нибудь [хорошее]». Такое играем как рекомендации/волну, а не
+/// ищем буквально. Жанры («классическую», «русскую», «джаз») сюда НЕ попадают.
+fn recommend_phrase(q: &str) -> bool {
+    let q = q.trim();
+    const ANY: [&str; 4] = ["что-нибудь", "что нибудь", "что-то", "чего-нибудь"];
+    if ANY.iter().any(|a| q == *a || q.starts_with(&format!("{a} ")) || q.starts_with(&format!("{a}е"))) {
+        return true;
+    }
+    // «<прилагательное-описание> музыку / песни / треки».
+    const NOUN: [&str; 7] = [" музыку", " музыка", " музычку", " музон", " песни", " песен", " треки"];
+    let Some(desc) = NOUN.iter().find_map(|n| q.strip_suffix(n)) else {
+        return false;
+    };
+    const ADJ: [&str; 17] = [
+        "хорош", "классн", "прикольн", "клёв", "клев", "крут", "приятн", "весёл", "весел",
+        "спокойн", "бодр", "расслабляющ", "фонов", "любим", "нормальн", "кайфов", "топов",
+    ];
+    let w = desc.trim().split_whitespace().last().unwrap_or("");
+    ADJ.iter().any(|a| w.starts_with(a))
+}
+
 fn intent_core(text: &str, keyword_only: bool) -> Option<Intent> {
     let (text, named) = strip_service(&normalize(text));
     match text.as_str() {
@@ -724,6 +746,9 @@ fn intent_core(text: &str, keyword_only: bool) -> Option<Intent> {
             .any(|w| HOME.iter().any(|p| w.starts_with(p)))
     {
         return None;
+    }
+    if recommend_phrase(query) {
+        return Some(Intent::Recommend);
     }
     Some(Intent::Play(query.to_owned()))
 }
