@@ -1,0 +1,51 @@
+#!/bin/sh
+DIR=/data/opt/soundya
+LOG=/tmp/soundya.log
+PID=/run/soundya.pid
+
+running() {
+    [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null
+}
+
+case "${1:-}" in
+    start)
+        rm -f /run/soundya.stop
+        if running; then
+            echo "soundya already running"
+            exit 0
+        fi
+        nohup setsid "$DIR/run.sh" </dev/null >>"$LOG" 2>&1 &
+        echo "soundya started (log: $LOG)"
+        ;;
+    stop)
+        touch /run/soundya.stop
+        if running; then
+            P=$(cat "$PID")
+            # run.sh is a session leader: stop it together with the daemon.
+            kill -TERM -- "-$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null
+        fi
+        rm -f "$PID"
+        for P in $(pidof soundya 2>/dev/null); do kill "$P" 2>/dev/null; done
+        sleep 1
+        # Switch off soundya's orange ring light (full 255/50/0 or a step of its
+        # loading fade: red about five times green, no blue) if it is still lit.
+        for Z in 1 2 3; do
+            L=/sys/class/leds/micro
+            [ -f "$L:red:ring$Z/brightness" ] || continue
+            R=$(cat "$L:red:ring$Z/brightness"); G=$(cat "$L:green:ring$Z/brightness"); B=$(cat "$L:blue:ring$Z/brightness")
+            if [ "$B" = 0 ] && [ "$R" -gt 0 ] && [ $((G * 5)) -le $((R + 5)) ] && [ $((G * 5)) -ge $((R - 5)) ]; then
+                for C in red green blue; do echo 0 > "$L:$C:ring$Z/brightness"; done
+            fi
+        done
+        echo "soundya stopped"
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac

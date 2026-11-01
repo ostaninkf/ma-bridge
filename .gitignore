@@ -1,0 +1,4 @@
+target/
+dist/
+config.go
+.DS_Store

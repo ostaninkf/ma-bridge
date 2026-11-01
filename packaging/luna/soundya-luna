@@ -1,0 +1,47 @@
+#!/bin/sh
+# Started by Luna (binary plugin, service). soundya keeps its settings in
+# Luna's state directory for the package; the helper programs stay in the
+# (read-only) package and are linked from there.
+# The package files sit next to this script, wherever it is started from
+# (Luna starts it from the plugin directory, a person may not).
+PAYLOAD=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+STATE=${LUNA_PLUGIN_STATE:-/data/opt/soundya-luna}
+mkdir -p "$STATE"
+
+# The standalone soundya (GitHub release, deploy.sh) runs on its own: two
+# copies would both answer Alice and play over each other.
+if [ -x /etc/init.d/S99soundya ]; then
+    echo "soundya: a standalone soundya is installed on this speaker (/data/opt/soundya)."
+    echo "soundya: remove it (settings page → «Удалить soundya») to run it from Luna."
+    while :; do sleep 3600; done
+fi
+
+for f in shairport-sync nfqws; do
+    [ -f "$PAYLOAD/$f" ] && ln -sf "$PAYLOAD/$f" "$STATE/$f"
+done
+[ -d "$PAYLOAD/fake" ] && ln -sfn "$PAYLOAD/fake" "$STATE/fake"
+# Settings that used to be in soundya.env.
+export SOUNDYA_DIR="$STATE"
+export SOUNDYA_WEB_PORT="${SOUNDYA_WEB_PORT:-8765}" SOUNDYA_NAME="${SOUNDYA_NAME:-soundya}" SOUNDYA_DEVICE="${SOUNDYA_DEVICE:-default}"
+# Play through the same ALSA libraries and plugins as Alice: her library path
+# (the vendor libasound needs plugins such as the rate converter, whose own
+# libraries live next to hers — Station Mini 1). Taken from her process.
+alice_libs() {
+    for p in $(pidof maind 2>/dev/null); do
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^LD_LIBRARY_PATH=//p' | head -1
+        return
+    done
+}
+ALICE_LD=$(alice_libs)
+if [ ! -f /etc/asound.conf ] && [ -d /system/vendor/quasar/libs ]; then
+    ALICE_LD="${ALICE_LD:+$ALICE_LD:}/system/vendor/quasar/libs"
+fi
+# The rate converter plugin's libsamplerate, wherever this firmware keeps it.
+for d in /system/vendor/quasar/libs /lib/linkplay_a98 /lib/linkplay_a98/lib /system/vendor/lib /system/lib /usr/lib /lib; do
+    if [ -e "$d/libsamplerate.so.0" ]; then
+        case ":$ALICE_LD:" in *":$d:"*) ;; *) ALICE_LD="${ALICE_LD:+$ALICE_LD:}$d" ;; esac
+        break
+    fi
+done
+[ -n "$ALICE_LD" ] && export LD_LIBRARY_PATH="$ALICE_LD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$PAYLOAD/soundya" daemon
