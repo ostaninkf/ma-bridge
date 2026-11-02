@@ -97,21 +97,27 @@ sh scripts/build-arm.sh          # armv7 (Linaro, glibc ≤2.23) -> dist/soundya
 # Пакет Luna (.yampkg):
 git clone https://github.com/nyakokitsu/yam ../yam
 (cd ../yam && cargo build --release --bin yam-publish)
-YAM_SRC=../yam YAM_PACK_ONLY=1 YAM_TARGETS=yandexmini_2 sh scripts/yam-release.sh
+# SOUNDYA_FRESH/SOUNDYA_BUILT — без git pull и сборки под macOS из апстримного скрипта
+SOUNDYA_FRESH=1 SOUNDYA_BUILT=1 YAM_SRC=../yam YAM_PACK_ONLY=1 YAM_TARGETS=yandexmini_2 \
+  sh scripts/yam-release.sh      # -> dist/ma-bridge-<версия>-yandexmini_2.yampkg
 ```
 
 ## Установка (пакетом Luna)
 
 ```sh
-adb push dist/soundya-<версия>-yandexmini_2.yampkg /tmp/ma.yampkg
+adb push dist/ma-bridge-<версия>-yandexmini_2.yampkg /tmp/ma.yampkg
 # Luna держит YAM-lock — на время установки её надо остановить:
 ssh root@<колонка> '/etc/init.d/S99luna stop && \
   /data/yam/bin/yam-run install --yes /tmp/ma.yampkg && \
   /etc/init.d/S99luna start'
 ```
 
-Два soundya одновременно нельзя (общий тап голоса, порт 8765, AirPlay) — ставить **вместо**
-штатного soundya. Автономный путь из апстрима (`scripts/deploy.sh`) тоже работает — см.
+Пакет называется `ostaninkf/ma-bridge` (Luna-плагин `ostaninkf.ma-bridge`), а не `rodyatotu/soundya`:
+обновление авторского soundya не перезапишет мост, а проверка обновлений в панели смотрит релизы
+этого репозитория. Два экземпляра одновременно нельзя (общий тап голоса, порт 8765, AirPlay).
+**Переезд с `rodyatotu/soundya`** (в т.ч. с ma-bridge до 0.5.0): поставить `ma-bridge`, затем
+`yam remove rodyatotu/soundya`. При первом запуске мост забирает настройки старого пакета (токены
+HA и SoundCloud, громкость) и ждёт, пока старый пакет не будет удалён. Автономный путь из апстрима (`scripts/deploy.sh`) тоже работает — см.
 [docs/README.upstream-soundya.md](docs/README.upstream-soundya.md).
 
 ## Настройка Music Assistant

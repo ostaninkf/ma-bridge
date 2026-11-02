@@ -17,7 +17,9 @@ use std::{
 
 use serde_json::Value;
 
-const RELEASES: &str = "https://api.github.com/repos/rodyatotu/soundya/releases/latest";
+/// Релизы форка ma-bridge, а не авторского soundya: иначе панель предложит «обновиться»
+/// на soundya без Music Assistant.
+const RELEASES: &str = "https://api.github.com/repos/ostaninkf/ma-bridge/releases/latest";
 const ASSET: &str = "soundya-armv7.tar";
 const TAR: &str = "/tmp/soundya-update.tar";
 const DIR: &str = "/tmp/soundya-update";
@@ -122,7 +124,7 @@ impl Updates {
         // A Luna package is YAM's to update: our own installer would put a
         // second, standalone copy next to it.
         if crate::luna::active() {
-            return Err("soundya стоит как пакет Luna: обновите его через YAM — yam install rodyatotu/soundya".into());
+            return Err("ma-bridge стоит как пакет Luna: обновите его через YAM — yam install <файл .yampkg из релиза ostaninkf/ma-bridge>".into());
         }
         if self.installing.swap(true, Ordering::AcqRel) {
             return Err("обновление уже устанавливается".into());

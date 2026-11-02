@@ -11,6 +11,7 @@
 # speaker on its own, so a dropped adb connection cannot leave it half-done.
 set -u
 cd "$(dirname "$0")/.."
+. scripts/fresh.sh
 IP=${1:?usage: scripts/deploy.sh <speaker-ip>}
 DEV="$IP:5555"
 TAR=dist/soundya-armv7.tar

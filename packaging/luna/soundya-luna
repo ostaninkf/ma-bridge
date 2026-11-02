@@ -8,6 +8,22 @@ PAYLOAD=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 STATE=${LUNA_PLUGIN_STATE:-/data/opt/soundya-luna}
 mkdir -p "$STATE"
 
+# ma-bridge: переезд с пакета rodyatotu/soundya (тот же мост под старым именем).
+# Первый запуск — забрать его настройки (токены HA и SoundCloud, громкость…);
+# пока старый пакет стоит — ждать: два экземпляра оба ответят Алисе.
+OLD_ID=rodyatotu.soundya
+OLD_STATE="$(dirname -- "$STATE")/$OLD_ID"
+if [ "$OLD_STATE" != "$STATE" ] && [ -f "$OLD_STATE/config.json" ] && [ ! -f "$STATE/config.json" ]; then
+    for f in "$OLD_STATE"/*; do
+        [ -f "$f" ] && [ ! -L "$f" ] && cp -p "$f" "$STATE/"
+    done
+    echo "ma-bridge: settings taken over from $OLD_ID"
+fi
+while [ -d "/data/yam/share/luna/plugins/$OLD_ID" ]; do
+    echo "ma-bridge: package rodyatotu/soundya is still installed; remove it: yam remove rodyatotu/soundya"
+    sleep 10
+done
+
 # The standalone soundya (GitHub release, deploy.sh) runs on its own: two
 # copies would both answer Alice and play over each other.
 if [ -x /etc/init.d/S99soundya ]; then
@@ -16,10 +32,11 @@ if [ -x /etc/init.d/S99soundya ]; then
     while :; do sleep 3600; done
 fi
 
-for f in shairport-sync nfqws; do
+for f in shairport-sync nfqws nfqws2; do
     [ -f "$PAYLOAD/$f" ] && ln -sf "$PAYLOAD/$f" "$STATE/$f"
 done
 [ -d "$PAYLOAD/fake" ] && ln -sfn "$PAYLOAD/fake" "$STATE/fake"
+[ -d "$PAYLOAD/lua" ] && ln -sfn "$PAYLOAD/lua" "$STATE/lua"
 # Settings that used to be in soundya.env.
 export SOUNDYA_DIR="$STATE"
 export SOUNDYA_WEB_PORT="${SOUNDYA_WEB_PORT:-8765}" SOUNDYA_NAME="${SOUNDYA_NAME:-soundya}" SOUNDYA_DEVICE="${SOUNDYA_DEVICE:-default}"

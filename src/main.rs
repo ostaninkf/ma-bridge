@@ -9,8 +9,10 @@ mod buttons;
 mod bypass;
 mod clock;
 mod dns;
+mod eq;
 mod fsx;
 mod history;
+mod ipt;
 mod led;
 mod luna;
 mod local;
@@ -111,6 +113,8 @@ pub struct Shared {
     status: Mutex<String>,
     /// Latest JSON for the web page, so it never waits for a busy controller.
     pub status_json: Mutex<String>,
+    /// The playing track's cover on SoundCloud, for the page's /cover.
+    pub cover: Mutex<Option<String>>,
     pub airplay: airplay::AirPlay,
     /// Anonymous statistics switched on (settings page).
     pub stats: AtomicBool,
@@ -363,7 +367,7 @@ impl Controller {
         };
         let current = self.current();
         // Its own macro call: one big json! runs out of the macro recursion limit.
-        let settings = serde_json::json!({
+        let mut settings = serde_json::json!({
             "proxy": self.settings.masked_proxy(),
             "keyword_only": self.settings.keyword_only,
             "ring": self.settings.ring,
@@ -398,7 +402,9 @@ impl Controller {
             "pc_on": self.settings.pc_on,
             "tv_on": self.settings.tv_on,
         });
-        serde_json::json!({
+        settings["eq_on"] = self.settings.eq_on.into();
+        settings["eq"] = self.settings.eq.clone().into();
+        let mut out = serde_json::json!({
             "state": state,
             "track": current.map(Track::name),
             "position_ms": position,
@@ -422,9 +428,11 @@ impl Controller {
             "bypass_log": *self.shared.bypass_log.lock().unwrap(),
             "bypass_busy": self.shared.bypass_busy.load(Ordering::Acquire),
             "volume": volume::level(),
-            "zapret_presets": zapret::PRESETS.iter().enumerate().map(|(i, (name, _))| [zapret::id_of(i), (*name).to_owned()]).collect::<Vec<_>>(),
-        })
-        .to_string()
+            "zapret_presets": zapret::PRESETS.iter().enumerate().map(|(i, (name, _))| { let id = zapret::id_of(i); let e = zapret::engine(&id, "").to_string(); [id, (*name).to_owned(), e] }).collect::<Vec<_>>(),
+        });
+        // Through the speaker: the phone may not reach sndcdn.com itself.
+        out["cover"] = current.filter(|t| t.cover().is_some()).map(|t| format!("/cover?{}", t.id)).into();
+        out.to_string()
     }
 
     /// Measures the round trip to SoundCloud in the background; `reply` is answered when done.
@@ -623,6 +631,7 @@ impl Controller {
         self.shared.keyword_only.store(new.keyword_only, Ordering::Release);
         self.shared.ring.store(new.ring, Ordering::Release);
         *self.shared.light.lock().unwrap() = led::Light::from_settings(&new);
+        eq::set(new.eq_on, &new.eq);
         new.airplay_name = new.airplay_name.trim().to_owned();
         self.shared.airplay.configure(new.airplay, &new.airplay_name, &new.airplay_icon);
         self.shared.stats.store(new.stats, Ordering::Release);
@@ -709,13 +718,13 @@ impl Controller {
                 } else {
                     self.original = None;
                 }
-                alice::pause_native();
                 self.queue = tracks;
                 self.failures = 0;
                 if let Some((name, cmd)) = self.asked.take() {
                     self.history.set(name, cmd);
                 }
                 self.start(0);
+                pause_native_again(&self.shared);
                 respond(reply, &format!("OK {}", self.status()), None);
             }
             Ok(_) => respond(
@@ -1145,8 +1154,8 @@ impl Controller {
             }
             Intent::Default => {
                 if !self.queue.is_empty() {
-                    alice::pause_native();
                     self.set_paused(false);
+                    pause_native_again(&self.shared);
                     respond(reply, "OK", None);
                 } else if self.client.has_token() {
                     self.intent(Intent::Likes, reply);
@@ -1175,17 +1184,8 @@ impl Controller {
                 // «Продолжи» reaches Alice's own player too: her paused Yandex
                 // Music would quietly start under SoundCloud. Pause it now and
                 // once more when her own answer to the phrase has arrived.
-                alice::pause_native();
                 self.set_paused(false);
-                let shared = self.shared.clone();
-                thread::spawn(move || {
-                    for wait in [800, 1500, 2500] {
-                        thread::sleep(Duration::from_millis(wait));
-                        if shared.playing.load(Ordering::Acquire) {
-                            alice::pause_native();
-                        }
-                    }
-                });
+                pause_native_again(&self.shared);
                 respond(reply, "OK", None);
             }
             Intent::Next => {
@@ -1464,7 +1464,7 @@ impl Controller {
             // «Удалить soundya» on the settings page: the speaker becomes plain Alice again.
             "uninstall" => {
                 let r = if luna::active() {
-                    "error: soundya стоит как пакет Luna: удалите его через YAM — yam remove rodyatotu/soundya".into()
+                    "error: ma-bridge стоит как пакет Luna: удалите его через YAM — yam remove ostaninkf/ma-bridge".into()
                 } else {
                     uninstall()
                 };
@@ -1853,6 +1853,17 @@ impl Controller {
     fn share_status(&self) {
         *self.shared.status.lock().unwrap() = self.status();
         *self.shared.status_json.lock().unwrap() = self.json();
+        let cover = self.current().and_then(Track::cover);
+        let changed = {
+            let mut now = self.shared.cover.lock().unwrap();
+            let changed = *now != cover;
+            *now = cover;
+            changed
+        };
+        // Fetched as the track starts: the page shows it at once.
+        if changed {
+            web::prefetch_cover(self.shared.clone());
+        }
     }
 }
 
@@ -1926,6 +1937,25 @@ fn blocked_hint(e: &str) -> String {
     } else {
         e.to_owned()
     }
+}
+
+/// Pauses Alice's own player now and a few more times while soundya starts:
+/// she pauses Yandex Music to listen to a phrase and turns it back on when her
+/// answer is over, which can be after soundya has already started, and then
+/// both play at once.
+fn pause_native_again(shared: &Arc<Shared>) {
+    alice::pause_native();
+    let shared = shared.clone();
+    thread::spawn(move || {
+        // The first track may still be loading: pause her player anyway, the
+        // user asked for SoundCloud.
+        for wait in [800, 1500, 2500, 4000] {
+            thread::sleep(Duration::from_millis(wait));
+            if !shared.alice_music() {
+                alice::pause_native();
+            }
+        }
+    });
 }
 
 /// A soundcloud.com link without the share tracking (?utm_source=… #…).
@@ -2009,6 +2039,7 @@ fn daemon() {
         queue: AtomicBool::new(false),
         status: Mutex::new("stopped".into()),
         status_json: Mutex::new(String::new()),
+        cover: Mutex::new(None),
         bypass_log: Mutex::new(Vec::new()),
         bypass_busy: AtomicBool::new(false),
         alice_music: AtomicBool::new(false),
@@ -2020,7 +2051,10 @@ fn daemon() {
         soundcloud: AtomicBool::new(settings.soundcloud),
         ma_enabled: AtomicBool::new(settings.ma_configured()),
         ma_active: AtomicBool::new(false),
-        light: Mutex::new(led::Light::from_settings(&settings)),
+        light: Mutex::new({
+            eq::set(settings.eq_on, &settings.eq);
+            led::Light::from_settings(&settings)
+        }),
     });
     let (tx, rx) = mpsc::channel();
     led::run(shared.clone());

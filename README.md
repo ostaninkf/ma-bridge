@@ -99,21 +99,27 @@ sh scripts/build-arm.sh          # armv7 (Linaro, glibc ≤2.23) -> dist/soundya
 # Luna package (.yampkg):
 git clone https://github.com/nyakokitsu/yam ../yam
 (cd ../yam && cargo build --release --bin yam-publish)
-YAM_SRC=../yam YAM_PACK_ONLY=1 YAM_TARGETS=yandexmini_2 sh scripts/yam-release.sh
+# SOUNDYA_FRESH/SOUNDYA_BUILT skip the upstream script's git pull and macOS build
+SOUNDYA_FRESH=1 SOUNDYA_BUILT=1 YAM_SRC=../yam YAM_PACK_ONLY=1 YAM_TARGETS=yandexmini_2 \
+  sh scripts/yam-release.sh      # -> dist/ma-bridge-<ver>-yandexmini_2.yampkg
 ```
 
 ## Install (as a Luna package)
 
 ```sh
-adb push dist/soundya-<ver>-yandexmini_2.yampkg /tmp/ma.yampkg
+adb push dist/ma-bridge-<ver>-yandexmini_2.yampkg /tmp/ma.yampkg
 # Luna holds the YAM lock, so stop it during install:
 ssh root@<speaker> '/etc/init.d/S99luna stop && \
   /data/yam/bin/yam-run install --yes /tmp/ma.yampkg && \
   /etc/init.d/S99luna start'
 ```
 
-Two soundya instances cannot run at once (they share the voice tap, port 8765 and AirPlay) —
-install this instead of the stock soundya. The standalone (non-Luna) path from upstream
+The package is `ostaninkf/ma-bridge` (Luna plugin `ostaninkf.ma-bridge`), not `rodyatotu/soundya`:
+an upstream soundya update will not overwrite the bridge, and the panel's update check looks at
+this repository's releases. Two instances cannot run at once (shared voice tap, port 8765, AirPlay).
+**Moving from `rodyatotu/soundya`** (including ma-bridge before 0.5.0): install `ma-bridge`, then
+`yam remove rodyatotu/soundya`. On first start the bridge takes over the old package's settings
+(HA and SoundCloud tokens, volume) and waits until the old package is removed. The standalone (non-Luna) path from upstream
 (`scripts/deploy.sh`) also works; see [docs/README.upstream-soundya.md](docs/README.upstream-soundya.md).
 
 ## Configure Music Assistant
