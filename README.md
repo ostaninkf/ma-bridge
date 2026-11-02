@@ -21,7 +21,8 @@ turns "Алиса, включи …" into an intent. This fork routes it:
 | "Алиса, включи **Кино** / **Агату Кристи** / **белую ворону**" | **Music Assistant**, local library only (see [Local search](#local-search)) |
 | "Алиса, включи **музыку**" (generic) | **Music Assistant** (resume, or start a radio/DJ stream) |
 | "Алиса, включи Кино **в саундклауде**" | SoundCloud (original soundya behaviour) |
-| "пауза / дальше / что играет / громче" | the active source (MA or SoundCloud) |
+| "пауза / продолжи / что играет" | the active source (MA or SoundCloud); MA counts as active whenever its player is playing (checked every 15 s) |
+| "дальше / назад" | **always MA**, unless the bridge's own SoundCloud is playing |
 | "… **в яндекс музыке**" | native Alice (unchanged) |
 
 The bridge does not stream audio itself — it calls the **Home Assistant REST API**

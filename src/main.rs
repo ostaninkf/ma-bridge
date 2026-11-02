@@ -2085,7 +2085,19 @@ fn daemon() {
     );
     // Локальный индекс библиотеки MA — сразу, чтобы первое «включи X» не ждало.
     if let Some(cfg) = ma::Cfg::from_settings(&settings) {
-        ma::refresh_local(cfg);
+        ma::refresh_local(cfg.clone());
+        // Играет MA — значит, он активный источник: «пауза / продолжи / что играет» идут в MA и
+        // после переустановки моста (иначе до первого запроса через мост они уходили Алисе).
+        let watch = shared.clone();
+        thread::spawn(move || loop {
+            if let Ok(np) = ma::now_playing(&cfg) {
+                if np.playing && !watch.ma_active() {
+                    eprintln!("ma: играет MA — источник MA");
+                    watch.set_ma_active(true);
+                }
+            }
+            thread::sleep(Duration::from_secs(15));
+        });
     }
     Controller {
         client: client_with(&settings),
