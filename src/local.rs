@@ -227,7 +227,8 @@ fn lev(a: &str, b: &str) -> usize {
 }
 
 /// Насколько слово запроса `q` совпадает со словом названия `t` (см. шкалу в шапке).
-pub fn tok_level(q: &str, t: &str) -> f32 {
+#[cfg(test)]
+fn tok_level(q: &str, t: &str) -> f32 {
     level(&Tok::new(q.to_owned()), &Tok::new(t.to_owned()))
 }
 
@@ -357,17 +358,18 @@ fn find_q<'a>(items: &'a [Item], q: &[Tok], prefer: Option<Kind>, bonus: fn(Kind
         return None;
     }
     let mut best: Option<Hit> = None;
+    let mut levels = Vec::with_capacity(q.len());
     'items: for it in items {
-        let toks: Vec<&Tok> = it.name_toks.iter().chain(&it.extra_toks).collect();
-        if toks.is_empty() {
+        if it.name_toks.is_empty() && it.extra_toks.is_empty() {
             continue;
         }
-        let mut levels = Vec::with_capacity(q.len());
+        let toks = || it.name_toks.iter().chain(&it.extra_toks);
+        levels.clear();
         for w in q {
-            let mut lv = toks.iter().map(|x| level(w, x)).fold(0.0, f32::max);
+            let mut lv = toks().map(|x| level(w, x)).fold(0.0, f32::max);
             // инициал в названии: «булата» ↔ «Б.», «фр» ↔ «F.R.» — по первой букве
             if lv == 0.0 && w.lat.len() >= 2 {
-                let initial = toks.iter().any(|x| !x.stop && x.raw.chars().count() == 1 && w.lat.starts_with(&x.lat));
+                let initial = toks().any(|x| !x.stop && x.raw.chars().count() == 1 && w.lat.starts_with(&x.lat));
                 if initial {
                     lv = 2.0;
                 }

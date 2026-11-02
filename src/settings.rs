@@ -103,12 +103,6 @@ pub struct Settings {
     /// Плеер колонки в MA/HA, напр. "media_player.yandexioreceiver_...".
     #[serde(default)]
     pub ma_entity: String,
-    /// radio_mode («диджей»: бесконечный поток по мотивам запроса).
-    #[serde(default = "yes")]
-    pub ma_radio: bool,
-    /// media_type по умолчанию для «включи X» ("" → "artist").
-    #[serde(default)]
-    pub ma_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -186,8 +180,6 @@ impl Default for Settings {
             ha_url: String::new(),
             ha_token: String::new(),
             ma_entity: String::new(),
-            ma_radio: true,
-            ma_type: String::new(),
         }
     }
 }

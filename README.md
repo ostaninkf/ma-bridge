@@ -124,7 +124,6 @@ Open `http://<speaker>:8765/` → **Music Assistant**:
 - **Player entity** — the speaker's `media_player.*` in MA/HA
 - **Token** — a Home Assistant long-lived access token (stored only on the speaker, masked in
   the UI)
-- **Default search type** and **DJ (radio_mode)** as you like
 
 ## Changes vs. soundya
 
@@ -135,7 +134,7 @@ Open `http://<speaker>:8765/` → **Music Assistant**:
 - `src/alice.rs` — routing (music → MA by default, "саундклауд" → SoundCloud; transport follows
   the active source; `keyword_only` skipped while MA is on; generic "включи музыку" → MA).
 - `src/main.rs` — `Cmd::Voice(Intent, bool)`, `ma_intent`, `Shared.ma_enabled/ma_active`.
-- `src/settings.rs` — `ma_enabled/ha_url/ha_token/ma_entity/ma_radio/ma_type`.
+- `src/settings.rs` — `ma_enabled/ha_url/ha_token/ma_entity`.
 - `src/web.html` — Music Assistant settings card.
 - `src/{buttons,luna}.rs` — buttons and Luna commands follow the active source.
 - `src/tv.rs` — "найди в пубере X" → `puber://search` deep link.

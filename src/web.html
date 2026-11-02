@@ -594,8 +594,8 @@
     <div class="msg" id="airplaymsg"></div>
 
     <h2 class="section">Music Assistant</h2>
-    <p class="hint">«Алиса, включи …» без слова «саундклауд» играет через Music Assistant
-      (Яндекс.Музыка, Spotify, ваша библиотека). Нужен Home Assistant с интеграцией Music
+    <p class="hint">«Алиса, включи …» без слова «саундклауд» ищет в вашей библиотеке Music Assistant
+      и играет через него. Нужен Home Assistant с интеграцией Music
       Assistant и его плеер для этой колонки. Токен — долгоживущий (Home Assistant → профиль →
       «Токены долгосрочного доступа»).</p>
     <label class="check">
@@ -607,18 +607,6 @@
     </label>
     <label class="field">Плеер колонки в MA (entity_id)
       <input type="text" id="maentity" placeholder="media_player.yandexioreceiver_..." autocomplete="off">
-    </label>
-    <label class="field">Что искать по умолчанию
-      <select id="matype">
-        <option value="artist">Исполнитель</option>
-        <option value="track">Трек</option>
-        <option value="album">Альбом</option>
-        <option value="playlist">Плейлист</option>
-      </select>
-    </label>
-    <label class="check">
-      <input type="checkbox" id="maradio" onchange="saveSettings('mamsg')">
-      <span>Диджей: бесконечный поток по мотивам запроса (radio_mode)</span>
     </label>
     <div class="row">
       <button class="primary" onclick="saveSettings('mamsg')">Сохранить</button>
@@ -1396,8 +1384,6 @@ async function refresh() {
     $('maen').checked = settings.ma_enabled !== false;
     $('haurl').value = settings.ha_url || '';
     $('maentity').value = settings.ma_entity || '';
-    $('matype').value = settings.ma_type || 'artist';
-    $('maradio').checked = settings.ma_radio !== false;
     $('hatokenstate').textContent = settings.ha_token ? ('Токен сохранён: ' + settings.ha_token) : 'Токен не задан — Music Assistant выключен.';
     settingsLoaded = true;
   }
@@ -1506,7 +1492,7 @@ function settingsBody(extra) {
     tv_host: $('tvhost').value,
     soundcloud: $('fsc').checked, pc_on: $('fpc').checked, tv_on: $('ftv').checked,
     ma_enabled: $('maen').checked, ha_url: $('haurl').value, ma_entity: $('maentity').value,
-    ma_radio: $('maradio').checked, ma_type: $('matype').value, ha_token: settings.ha_token
+    ha_token: settings.ha_token
   }, extra));
 }
 

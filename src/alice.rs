@@ -34,7 +34,7 @@ pub fn answer(text: &str) -> Option<Answer> {
     let (t, _) = strip_service(&normalize(text));
     let t = t.replace([',', '.', '!', '?'], " ").split_whitespace().collect::<Vec<_>>().join(" ");
     let t = t.as_str();
-    if t.contains("спотиф") || t.contains("spotify") || t.contains("спотифай") {
+    if t.contains("спотиф") || t.contains("spotify") {
         return Some(Answer::Spotify);
     }
     match t {
@@ -705,7 +705,8 @@ pub fn intent(text: &str, keyword_only: bool) -> Option<Intent> {
 fn recommend_phrase(q: &str) -> bool {
     let q = q.trim();
     const ANY: [&str; 4] = ["что-нибудь", "что нибудь", "что-то", "чего-нибудь"];
-    if ANY.iter().any(|a| q == *a || q.starts_with(&format!("{a} ")) || q.starts_with(&format!("{a}е"))) {
+    // «что-нибудь», «что-нибудь хорошее», «что-нибудьеще» (Алиса бывает слитно)
+    if ANY.iter().any(|a| q.strip_prefix(a).is_some_and(|r| r.is_empty() || r.starts_with([' ', 'е']))) {
         return true;
     }
     // «<прилагательное-описание> музыку / песни / треки».
@@ -717,7 +718,7 @@ fn recommend_phrase(q: &str) -> bool {
         "хорош", "классн", "прикольн", "клёв", "клев", "крут", "приятн", "весёл", "весел",
         "спокойн", "бодр", "расслабляющ", "фонов", "любим", "нормальн", "кайфов", "топов",
     ];
-    let w = desc.trim().split_whitespace().last().unwrap_or("");
+    let w = desc.split_whitespace().last().unwrap_or("");
     if ADJ.iter().any(|a| w.starts_with(a)) {
         return true;
     }
@@ -1033,15 +1034,22 @@ static SAY_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// Runs a moment later so it is not swallowed by the cancel of the user's own request;
 /// right before speaking, Alice's own answer is cancelled once.
 pub fn say(text: String) {
+    vocalize("say", text, || {});
+}
+
+/// Общая часть `say`/`ask`: в отдельном потоке подождать, срезать ответ Алисы, сказать
+/// `text`; `then` выполняется сразу после речи, пока глушилка ещё молчит.
+fn vocalize(tag: &'static str, text: String, then: impl FnOnce() + Send + 'static) {
     SAY_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(600));
         cancel_alice();
         thread::sleep(Duration::from_millis(150));
         match speak(&text) {
-            Ok(()) => eprintln!("say: {text:?}"),
-            Err(e) => eprintln!("say: {text:?}: {e}"),
+            Ok(()) => eprintln!("{tag}: {text:?}"),
+            Err(e) => eprintln!("{tag}: {text:?}: {e}"),
         }
+        then();
         SAY_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
 }
@@ -1065,17 +1073,8 @@ pub fn stop_listening() {
 /// (AliceCapability method 2 = startConversation, номер из прошивки maind,
 /// LOG.md 02.11): ответить можно без «Алиса». `after` — когда начали слушать.
 pub fn ask(text: String, after: impl FnOnce() + Send + 'static) {
-    SAY_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(600));
-        cancel_alice();
-        thread::sleep(Duration::from_millis(150));
-        match speak(&text) {
-            Ok(()) => eprintln!("ask: {text:?}"),
-            Err(e) => eprintln!("ask: {text:?}: {e}"),
-        }
+    vocalize("ask", text, move || {
         *LISTEN_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + LISTEN_WINDOW);
-        SAY_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         match send_native(&rpc("AliceCapability", 8, &[8, 2])) {
             Ok(()) => eprintln!("ask: слушаю ответ {} с", LISTEN_WINDOW.as_secs()),
             Err(e) => eprintln!("ask: не открыл микрофон: {e}"),
@@ -1265,7 +1264,9 @@ fn read_frames(
             // messages are ours; all music stays Alice's.
             let music = !matches!(intent, Intent::Pc(_) | Intent::Tv(_));
             // ma-bridge: решаем, куда направить — Music Assistant или SoundCloud.
-            let (_, named_sc) = strip_service(&text);
+            // Так же, как в intent_core: по нормализованному тексту (регистр, точка в конце),
+            // иначе «…в Саундклауде.» не распознаётся и уходит в MA.
+            let (_, named_sc) = strip_service(&normalize(&text));
             let play_like = matches!(
                 intent,
                 Intent::Play(_)

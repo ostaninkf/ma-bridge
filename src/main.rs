@@ -225,7 +225,7 @@ fn fmt_ms(ms: u64) -> String {
 /// совпадение молча; похожие песни — с пояснением; ничего — «Локально не найдено».
 fn play_local_or_say(cfg: &ma::Cfg, q: &str, prefer: Option<local::Kind>) -> ma::Res<()> {
     match ma::play_local(cfg, q, prefer)? {
-        ma::Local::Exact(_) => {}
+        ma::Local::Exact => {}
         // Вопрос — и сразу слушаем ответ (без «Алиса»), окно alice::LISTEN_WINDOW.
         ma::Local::Similar(n) => alice::ask(
             format!("Точно такого нет. Нашла похожие песни: {n}. Включить их или поискать на Спотифай?"),
@@ -388,8 +388,6 @@ impl Controller {
             "ha_url": self.settings.ha_url,
             "ha_token": self.settings.masked_ha_token(),
             "ma_entity": self.settings.ma_entity,
-            "ma_radio": self.settings.ma_radio,
-            "ma_type": self.settings.ma_type,
             "light_mode": self.settings.light_mode,
             "light_color": self.settings.light_color,
             "light_color2": self.settings.light_color2,
@@ -640,7 +638,6 @@ impl Controller {
         new.ha_token = new.ha_token.trim().to_owned();
         new.ha_url = new.ha_url.trim().trim_end_matches('/').to_owned();
         new.ma_entity = new.ma_entity.trim().to_owned();
-        new.ma_type = new.ma_type.trim().to_owned();
         self.shared.ma_enabled.store(new.ma_configured(), Ordering::Release);
         let proxy_changed = new.use_proxy() != self.settings.use_proxy();
         self.settings = new;
@@ -1026,13 +1023,7 @@ impl Controller {
                 alice::say(ma::what_playing_phrase(&cfg));
                 return;
             }
-            Intent::Like
-            | Intent::Unlike
-            | Intent::AddToPlaylist(_)
-            | Intent::ToAlice
-            | Intent::Pc(_)
-            | Intent::Tv(_)
-            | Intent::Shuffled(_) => {
+            Intent::Like | Intent::Unlike | Intent::AddToPlaylist(_) | Intent::ToAlice | Intent::Pc(_) | Intent::Tv(_) => {
                 eprintln!("ma: {label} не поддерживается в режиме MA");
                 return;
             }
@@ -1073,7 +1064,7 @@ impl Controller {
                 // «Похожее / рекомендации»: диджей-волна по текущему исполнителю (или треку).
                 Intent::Recommend | Intent::Similar => match ma::now_playing(&cfg) {
                     Ok(np) => match np.artist.or(np.title) {
-                        Some(seed) => ma::play(&cfg, &seed, Some("artist"), Some(true)),
+                        Some(seed) => ma::play_radio(&cfg, &seed),
                         None => ma::resume_restore(&cfg),
                     },
                     Err(e) => Err(e),
@@ -1084,18 +1075,11 @@ impl Controller {
                 Intent::Next => ma::next(&cfg),
                 Intent::Previous => ma::previous(&cfg),
                 Intent::Seek(by) => ma::seek(&cfg, by),
-                Intent::Restart => ma::seek(&cfg, -3_600_000),
+                Intent::Restart => ma::seek_to(&cfg, 0.0),
                 Intent::Shuffle(on) => ma::set_shuffle(&cfg, on),
                 Intent::Repeat(on) => ma::set_repeat(&cfg, on),
-                // Обработано выше (inline) — сюда не попадают.
-                Intent::WhatPlaying
-                | Intent::Like
-                | Intent::Unlike
-                | Intent::AddToPlaylist(_)
-                | Intent::ToAlice
-                | Intent::Pc(_)
-                | Intent::Tv(_)
-                | Intent::Shuffled(_) => return,
+                // WhatPlaying, Shuffled и неподдерживаемые обработаны выше.
+                _ => return,
             };
             if let Err(e) = r {
                 // ВАЖНО: ma::play_media у HA часто «таймаутит» (десятки секунд не
@@ -2090,11 +2074,9 @@ fn daemon() {
         // после переустановки моста (иначе до первого запроса через мост они уходили Алисе).
         let watch = shared.clone();
         thread::spawn(move || loop {
-            if let Ok(np) = ma::now_playing(&cfg) {
-                if np.playing && !watch.ma_active() {
-                    eprintln!("ma: играет MA — источник MA");
-                    watch.set_ma_active(true);
-                }
+            if watch.ma_enabled() && !watch.ma_active() && ma::now_playing(&cfg).is_ok_and(|np| np.playing) {
+                eprintln!("ma: играет MA — источник MA");
+                watch.set_ma_active(true);
             }
             thread::sleep(Duration::from_secs(15));
         });

@@ -121,7 +121,6 @@ ssh root@<колонка> '/etc/init.d/S99luna stop && \
 - **Адрес Home Assistant** — напр. `http://homeassistant.local:8123`
 - **Плеер колонки** — `media_player.*` колонки в MA/HA
 - **Токен** — долгоживущий токен Home Assistant (хранится только на колонке, в UI маскируется)
-- **Тип по умолчанию** и **Диджей (radio_mode)** — по вкусу
 
 ## Отличия от soundya
 
@@ -133,7 +132,7 @@ ssh root@<колонка> '/etc/init.d/S99luna stop && \
   за активным источником; `keyword_only` не применяется при включённом MA; генерик «включи
   музыку» → MA).
 - `src/main.rs` — `Cmd::Voice(Intent, bool)`, `ma_intent`, `Shared.ma_enabled/ma_active`.
-- `src/settings.rs` — `ma_enabled/ha_url/ha_token/ma_entity/ma_radio/ma_type`.
+- `src/settings.rs` — `ma_enabled/ha_url/ha_token/ma_entity`.
 - `src/web.html` — карточка настроек Music Assistant.
 - `src/{buttons,luna}.rs` — кнопки и команды Luna идут в активный источник.
 - `src/tv.rs` — «найди в пубере X» → deep link `puber://search`.

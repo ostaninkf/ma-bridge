@@ -4,16 +4,13 @@
 //! Этот модуль НЕ играет звук сам: он зовёт сервисы Home Assistant, а MA
 //! воспроизводит на плеере-колонке своим провайдером (путь glagol+mediad).
 //!
-//! Воспроизведение: `music_assistant.play_media` (поиск по имени + radio_mode
-//! для «диджей»-бесконечного потока). Транспорт/громкость: `media_player.*`.
-//! «Что играет»: `GET /api/states/<entity>`.
+//! Воспроизведение: `music_assistant.play_media`. Транспорт: `media_player.*`.
+//! Состояние плеера: шаблон HA (`/api/template`) — трек, исполнитель и позиция одним запросом.
 //!
 //! Конфиг (из settings.rs, заполняет пользователь — токен в файлы не писать):
 //!   ha_url    напр. http://192.168.3.8:8123
 //!   ha_token  long-lived access token Home Assistant (из DJ-интеграции)
 //!   ma_entity media_player.* колонки (напр. media_player.yandexioreceiver_...)
-//!   ma_radio  включать radio_mode (диджей) для «включи <артист>»
-//!   ma_type   media_type по умолчанию для «включи X» (artist|track|...)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,8 +25,6 @@ pub struct Cfg {
     pub url: String,
     pub token: String,
     pub entity: String,
-    pub radio: bool,
-    pub default_type: String,
 }
 
 impl Cfg {
@@ -41,83 +36,81 @@ impl Cfg {
         if url.is_empty() || token.is_empty() || entity.is_empty() {
             return None;
         }
-        let default_type = if s.ma_type.trim().is_empty() {
-            "artist".to_string()
-        } else {
-            s.ma_type.trim().to_string()
-        };
-        Some(Cfg {
-            url,
-            token,
-            entity,
-            radio: s.ma_radio,
-            default_type,
-        })
+        Some(Cfg { url, token, entity })
     }
 }
 
 pub type Res<T> = Result<T, String>;
 
-fn agent() -> ureq::Agent {
+/// Один агент на процесс: соединение с HA переиспользуется (keep-alive), а не
+/// открывается заново на каждый запрос.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     // Генерация диджей-волны (radio_mode) в MA может длиться десятки секунд —
     // HA держит HTTP-ответ до её конца, поэтому читаем ответ долго. Сам вызов
     // идёт в фоне (см. ma_intent), цикл команд этим не блокируется.
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(35))
-        .timeout_write(Duration::from_secs(10))
-        .build()
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(35))
+            .timeout_write(Duration::from_secs(10))
+            .build()
+    })
+}
+
+/// POST `<ha_url><path>` с JSON-телом и токеном; ошибка — с HTTP-кодом и телом ответа.
+fn post(cfg: &Cfg, path: &str, body: serde_json::Value) -> Res<ureq::Response> {
+    match agent()
+        .post(&format!("{}{path}", cfg.url))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .send_json(body)
+    {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(code, resp)) => {
+            Err(format!("HTTP {code} {}", resp.into_string().unwrap_or_default().trim()))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Сервис с ответом (`?return_response=true`): поле `service_response`.
+fn service_response(cfg: &Cfg, service: &str, body: serde_json::Value) -> Res<serde_json::Value> {
+    let mut v: serde_json::Value = post(cfg, &format!("/api/services/music_assistant/{service}?return_response=true"), body)?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    Ok(v["service_response"].take())
+}
+
+/// Отрисовать шаблон HA.
+fn template(cfg: &Cfg, tpl: &str) -> Res<String> {
+    post(cfg, "/api/template", serde_json::json!({ "template": tpl }))?
+        .into_string()
+        .map_err(|e| e.to_string())
 }
 
 /// POST /api/services/<domain>/<service> с телом data (entity_id внутри data —
 /// REST API HA принимает target так же).
 fn call_service(cfg: &Cfg, domain: &str, service: &str, mut data: serde_json::Value) -> Res<()> {
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("entity_id".into(), serde_json::json!(cfg.entity));
-    }
-    let url = format!("{}/api/services/{}/{}", cfg.url, domain, service);
-    match agent()
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", "application/json")
-        .send_json(data)
-    {
-        Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            Err(format!("HA {domain}.{service}: HTTP {code} {}", body.trim()))
-        }
-        Err(e) => Err(format!("HA {domain}.{service}: {e}")),
-    }
+    data["entity_id"] = serde_json::json!(cfg.entity);
+    post(cfg, &format!("/api/services/{domain}/{service}"), data)
+        .map(drop)
+        .map_err(|e| format!("HA {domain}.{service}: {e}"))
 }
 
-/// config_entry_id интеграции Music Assistant в HA (нужен сервису search).
+/// config_entry_id интеграции Music Assistant в HA (нужен сервисам search/get_library).
 /// Берём через шаблон по сущности плеера и кэшируем — он не меняется.
-static CONFIG_ENTRY: OnceLock<String> = OnceLock::new();
-
-fn config_entry_id(cfg: &Cfg) -> Option<String> {
+fn config_entry_id(cfg: &Cfg) -> Res<String> {
+    static CONFIG_ENTRY: OnceLock<String> = OnceLock::new();
     if let Some(v) = CONFIG_ENTRY.get() {
-        return Some(v.clone());
+        return Ok(v.clone());
     }
-    let url = format!("{}/api/template", cfg.url);
-    let body = serde_json::json!({
-        "template": format!("{{{{ config_entry_id('{}') }}}}", cfg.entity)
-    });
-    let s = agent()
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .ok()?
-        .into_string()
-        .ok()?
-        .trim()
-        .to_string();
+    let s = template(cfg, &format!("{{{{ config_entry_id('{}') }}}}", cfg.entity))
+        .map_err(|e| format!("config_entry_id: {e}"))?;
+    let s = s.trim();
     if s.is_empty() || s == "None" {
-        return None;
+        return Err("нет config_entry_id Music Assistant".into());
     }
-    let _ = CONFIG_ENTRY.set(s.clone());
-    Some(s)
+    Ok(CONFIG_ENTRY.get_or_init(|| s.to_owned()).clone())
 }
 
 fn plural(mtype: &str) -> &'static str {
@@ -132,49 +125,18 @@ fn plural(mtype: &str) -> &'static str {
     }
 }
 
-/// Один поиск через сервис `music_assistant.search`. Возвращает uri первого
-/// подходящего результата нужного типа. `library_only` — только локальная
-/// библиотека (локальные файлы). `want_prefix` — брать первый результат, чей uri
-/// начинается с этого префикса (напр. "spotify--"), иначе первый вообще.
-fn search_uri(
-    cfg: &Cfg,
-    ce: &str,
-    query: &str,
-    mtype: &str,
-    library_only: bool,
-    want_prefix: Option<&str>,
-) -> Option<String> {
-    let mut body = serde_json::json!({
+/// Один поиск через сервис `music_assistant.search`: uri первого результата нужного
+/// типа. `library_only` — только локальная библиотека.
+fn search_uri(cfg: &Cfg, ce: &str, query: &str, mtype: &str, library_only: bool) -> Option<String> {
+    let body = serde_json::json!({
         "config_entry_id": ce,
         "name": query,
         "media_type": [mtype],
         "limit": 8,
+        "library_only": library_only,
     });
-    if library_only {
-        body["library_only"] = serde_json::json!(true);
-    }
-    let url = format!(
-        "{}/api/services/music_assistant/search?return_response=true",
-        cfg.url
-    );
-    let v: serde_json::Value = agent()
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .ok()?
-        .into_json()
-        .ok()?;
-    let items = v["service_response"][plural(mtype)].as_array()?;
-    match want_prefix {
-        Some(pfx) => items.iter().find_map(|it| {
-            let u = it["uri"].as_str()?;
-            u.starts_with(pfx).then(|| u.to_string())
-        }),
-        None => items
-            .first()
-            .and_then(|it| it["uri"].as_str().map(str::to_string)),
-    }
+    let v = service_response(cfg, "search", body).ok()?;
+    v[plural(mtype)].get(0)?["uri"].as_str().map(str::to_owned)
 }
 
 /// «Включи X» ставит X в винительный падеж: «Агутина», «Земфиру», «Сплина».
@@ -199,23 +161,23 @@ fn ru_stem(query: &str) -> Option<String> {
 /// обычный поиск (Spotify, т.к. Yandex Music отключён). Возвращает media_id для
 /// play_media: найденный uri, иначе — имя как есть (пусть MA пробует сам).
 fn resolve_media_id(cfg: &Cfg, query: &str, mtype: &str) -> String {
-    let Some(ce) = config_entry_id(cfg) else {
+    let Ok(ce) = config_entry_id(cfg) else {
         return query.to_string();
     };
     // 1. Локальная библиотека — быстро (~20 мс) и в приоритете.
-    if let Some(uri) = search_uri(cfg, &ce, query, mtype, true, None) {
+    if let Some(uri) = search_uri(cfg, &ce, query, mtype, true) {
         eprintln!("ma: «{query}» → локально {uri}");
         return uri;
     }
     // 2. Нелокальный поиск. play_media по сырому имени падежи не понимает
     //    («включи Агутина» → «агутина» → MA «Could not resolve»), а search вернёт uri.
-    if let Some(uri) = search_uri(cfg, &ce, query, mtype, false, None) {
+    if let Some(uri) = search_uri(cfg, &ce, query, mtype, false) {
         eprintln!("ma: «{query}» → {uri}");
         return uri;
     }
     // 3. Винительный падеж: пробуем основу без хвостовой гласной («агутина» → «агутин»).
     if let Some(stem) = ru_stem(query) {
-        if let Some(uri) = search_uri(cfg, &ce, &stem, mtype, false, None) {
+        if let Some(uri) = search_uri(cfg, &ce, &stem, mtype, false) {
             eprintln!("ma: «{query}» → основа «{stem}» → {uri}");
             return uri;
         }
@@ -223,21 +185,6 @@ fn resolve_media_id(cfg: &Cfg, query: &str, mtype: &str) -> String {
     // 4. Ничего не нашли поиском — отдаём имя, пусть MA пробует сам.
     eprintln!("ma: «{query}» → не найдено поиском, отдаём MA как есть");
     query.to_string()
-}
-
-/// Запрос-жанр («джаз», «рок», «классика»…), а не исполнитель. Такое лучше играть
-/// как плейлист (жанровые подборки), а не искать исполнителя с таким именем.
-pub fn is_genre(query: &str) -> bool {
-    let q = query.trim().to_lowercase().replace('ё', "е");
-    const GENRES: [&str; 34] = [
-        "джаз", "рок", "поп", "классик", "блюз", "метал", "рэп", "хип-хоп", "хипхоп", "хип хоп",
-        "электрон", "техно", "хаус", "диско", "фанк", "соул", "регги", "регей", "кантри", "шансон",
-        "инди", "панк", "лоуфай", "лоу-фай", "lofi", "эмбиент", "транс", "драм-н-бейс", "дабстеп",
-        "опера", "рнб", "r&b", "релакс", "ретро",
-    ];
-    // Один-два слова, совпадающих со стержнем жанра («джаз», «классическую», «рок музыка»).
-    let first = q.split_whitespace().next().unwrap_or(&q);
-    GENRES.iter().any(|g| first.starts_with(g) || q == *g)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,25 +202,20 @@ const LOCAL_RETRY_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Список библиотеки MA одного типа (`music_assistant.get_library`).
 fn get_library(cfg: &Cfg, ce: &str, mtype: &str) -> Res<Vec<serde_json::Value>> {
-    let url = format!("{}/api/services/music_assistant/get_library?return_response=true", cfg.url);
     let body = serde_json::json!({ "config_entry_id": ce, "media_type": mtype, "limit": 20000 });
-    let v: serde_json::Value = agent()
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| format!("get_library {mtype}: {e}"))?
-        .into_json()
-        .map_err(|e| format!("get_library {mtype}: {e}"))?;
-    v["service_response"]["items"]
-        .as_array()
-        .cloned()
-        .ok_or_else(|| format!("get_library {mtype}: нет items в ответе"))
+    match service_response(cfg, "get_library", body) {
+        Ok(serde_json::Value::Object(mut m)) => match m.remove("items") {
+            Some(serde_json::Value::Array(items)) => Ok(items),
+            _ => Err(format!("get_library {mtype}: нет items в ответе")),
+        },
+        Ok(_) => Err(format!("get_library {mtype}: нет items в ответе")),
+        Err(e) => Err(format!("get_library {mtype}: {e}")),
+    }
 }
 
 fn build_local(cfg: &Cfg) -> Res<Arc<Vec<local::Item>>> {
     let t0 = Instant::now();
-    let ce = config_entry_id(cfg).ok_or("нет config_entry_id Music Assistant")?;
+    let ce = config_entry_id(cfg)?;
     let artists = get_library(cfg, &ce, "artist")?;
     let albums = get_library(cfg, &ce, "album")?;
     let tracks = get_library(cfg, &ce, "track")?;
@@ -356,7 +298,7 @@ const SIMILAR_MAX: usize = 30;
 /// Чем закончился локальный «включи X».
 pub enum Local {
     /// Точное совпадение — играет оно.
-    Exact(String),
+    Exact,
     /// Точного нет, есть N похожих — НЕ играют, ждут ответа (см. Pending).
     Similar(usize),
     /// Ничего общего — ничего не запущено.
@@ -423,7 +365,7 @@ pub fn answer_similar(cfg: &Cfg, a: crate::alice::Answer) -> Res<()> {
 /// запрос как есть, без слова-подсказки и основой без падежного окончания.
 /// true — нашли и запустили.
 fn play_spotify(cfg: &Cfg, query: &str) -> Res<bool> {
-    let ce = config_entry_id(cfg).ok_or("нет config_entry_id Music Assistant")?;
+    let ce = config_entry_id(cfg)?;
     let bare = crate::alice::music_query(query).to_owned();
     // Spotify сам падежи не понимает («агутина» → пусто): ищем и основой без окончания.
     let mut variants = vec![bare.clone()];
@@ -434,20 +376,11 @@ fn play_spotify(cfg: &Cfg, query: &str) -> Res<bool> {
     // иначе первый артист выдачи («хочу перемен» → Peremotka) побеждает песню.
     let mut items = Vec::new();
     for q in &variants {
-        let url = format!("{}/api/services/music_assistant/search?return_response=true", cfg.url);
         let body = serde_json::json!({
             "config_entry_id": ce, "name": q, "media_type": ["artist", "album", "track"], "limit": 10,
         });
-        let resp: serde_json::Value = match agent()
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", cfg.token))
-            .set("Content-Type", "application/json")
-            .send_json(body)
-        {
-            Ok(r) => r.into_json().unwrap_or_default(),
-            Err(e) => return Err(format!("поиск Spotify «{q}»: {e}")),
-        };
-        items.extend(local::from_search(&resp["service_response"], "spotify"));
+        let resp = service_response(cfg, "search", body).map_err(|e| format!("поиск Spotify «{q}»: {e}"))?;
+        items.extend(local::from_search(&resp, "spotify"));
     }
     let Some(hit) = local::find_spotify(&items, query) else {
         let seen: Vec<String> = items.iter().take(6).map(|i| format!("{} «{}»", i.kind.media_type(), i.name)).collect();
@@ -469,13 +402,9 @@ fn play_spotify(cfg: &Cfg, query: &str) -> Res<bool> {
 /// Запрос голосом играет один раз, без повтора: доиграл — HA возвращает эфир диджея
 /// (автоматизация dj_after_request, решение 02.11). Ошибку только пишем в журнал.
 fn request_no_repeat(cfg: &Cfg) {
-    if let Err(e) = set_repeat_off(cfg) {
+    if let Err(e) = set_repeat(cfg, false) {
         eprintln!("ma: не выключил повтор очереди: {e}");
     }
-}
-
-fn set_repeat_off(cfg: &Cfg) -> Res<()> {
-    call_service(cfg, "media_player", "repeat_set", serde_json::json!({ "repeat": "off" }))
 }
 
 /// «Включи X» — ТОЛЬКО локальная библиотека: точное совпадение, иначе похожие
@@ -497,7 +426,7 @@ pub fn play_local(cfg: &Cfg, query: &str, prefer: Option<local::Kind>) -> Res<Lo
             "play_media",
             serde_json::json!({ "media_id": item.uri, "media_type": mtype, "radio_mode": false }),
         )?;
-        return Ok(Local::Exact(item.name));
+        return Ok(Local::Exact);
     }
     let similar = local::find_similar(&idx, query, SIMILAR_MAX);
     if similar.is_empty() {
@@ -514,20 +443,16 @@ pub fn play_local(cfg: &Cfg, query: &str, prefer: Option<local::Kind>) -> Res<Lo
     Ok(Local::Similar(similar.len()))
 }
 
-/// «Включи X»: по правилу провайдеров (локальное → Spotify) находит конкретный
-/// элемент и играет его на колонке через MA.
-/// `media_type` None → cfg.default_type. `radio` None → cfg.radio.
-pub fn play(cfg: &Cfg, query: &str, media_type: Option<&str>, radio: Option<bool>) -> Res<()> {
-    let mtype = media_type.unwrap_or(&cfg.default_type);
-    let media_id = resolve_media_id(cfg, query, mtype);
-    let mut data = serde_json::json!({
-        "media_id": media_id,
-        "radio_mode": radio.unwrap_or(cfg.radio),
-    });
-    if !mtype.is_empty() {
-        data["media_type"] = serde_json::json!(mtype);
-    }
-    call_service(cfg, "music_assistant", "play_media", data)
+/// Диджей-волна MA (radio_mode) от исполнителя `seed`: сначала ищется в библиотеке,
+/// затем во всех провайдерах (локальное → Spotify).
+pub fn play_radio(cfg: &Cfg, seed: &str) -> Res<()> {
+    let media_id = resolve_media_id(cfg, seed, "artist");
+    call_service(
+        cfg,
+        "music_assistant",
+        "play_media",
+        serde_json::json!({ "media_id": media_id, "media_type": "artist", "radio_mode": true }),
+    )
 }
 
 pub fn pause(cfg: &Cfg) -> Res<()> {
@@ -539,26 +464,6 @@ pub fn pause(cfg: &Cfg) -> Res<()> {
 /// трек с 0:00 (02.11: «К чему нам быть на ты» с 1,5 мин → с начала). Место помним сами.
 static PAUSED_AT: Mutex<Option<(String, f64)>> = Mutex::new(None);
 
-/// Текущая секунда трека: media_position + время с media_position_updated_at (HA обновляет
-/// позицию не постоянно).
-fn position_now(cfg: &Cfg) -> Option<f64> {
-    let e = &cfg.entity;
-    let tpl = format!(
-        "{{% set u = state_attr('{e}', 'media_position_updated_at') %}}\
-         {{{{ (state_attr('{e}', 'media_position') | float(-1)) + \
-         ((now() - u).total_seconds() if u is not none and is_state('{e}', 'playing') else 0) }}}}"
-    );
-    let s = agent()
-        .post(&format!("{}/api/template", cfg.url))
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", "application/json")
-        .send_json(serde_json::json!({ "template": tpl }))
-        .ok()?
-        .into_string()
-        .ok()?;
-    s.trim().parse::<f64>().ok().filter(|p| *p >= 0.0)
-}
-
 /// Перемотка на абсолютную секунду текущего трека.
 pub fn seek_to(cfg: &Cfg, pos_s: f64) -> Res<()> {
     call_service(cfg, "media_player", "media_seek", serde_json::json!({ "seek_position": pos_s.round() }))
@@ -567,7 +472,7 @@ pub fn seek_to(cfg: &Cfg, pos_s: f64) -> Res<()> {
 /// «Пауза»: запомнить трек и секунду, затем пауза в MA.
 pub fn pause_remember(cfg: &Cfg) -> Res<()> {
     if let Ok(np) = now_playing(cfg) {
-        if let (true, Some(title), Some(pos)) = (np.playing, np.title, position_now(cfg)) {
+        if let (true, Some(title), Some(pos)) = (np.playing, np.title, np.position_s) {
             eprintln!("ma: пауза на «{title}», {pos:.0} с");
             *PAUSED_AT.lock().unwrap() = Some((title, pos));
         }
@@ -595,7 +500,7 @@ pub fn resume_restore(cfg: &Cfg) -> Res<()> {
             eprintln!("ma: продолжить: играет другой трек, место «{title}» не возвращаю");
             return Ok(());
         }
-        let cur = position_now(cfg).unwrap_or(0.0);
+        let cur = np.position_s.unwrap_or(0.0);
         if (cur - pos).abs() > 4.0 {
             eprintln!("ma: продолжить: MA начал «{title}» с {cur:.0} с, возвращаю на {pos:.0} с");
             seek_to(cfg, pos)?;
@@ -620,15 +525,8 @@ pub fn previous(cfg: &Cfg) -> Res<()> {
 
 /// Перемотка на `by_ms` относительно текущей позиции (может быть отрицательной).
 pub fn seek(cfg: &Cfg, by_ms: i64) -> Res<()> {
-    let now = now_playing(cfg)?;
-    let pos = now.position_s.unwrap_or(0.0);
-    let target = (pos + by_ms as f64 / 1000.0).max(0.0);
-    call_service(
-        cfg,
-        "media_player",
-        "media_seek",
-        serde_json::json!({ "seek_position": target }),
-    )
+    let pos = now_playing(cfg)?.position_s.unwrap_or(0.0);
+    seek_to(cfg, (pos + by_ms as f64 / 1000.0).max(0.0))
 }
 
 pub fn set_shuffle(cfg: &Cfg, on: bool) -> Res<()> {
@@ -650,63 +548,39 @@ pub fn set_repeat(cfg: &Cfg, on: bool) -> Res<()> {
     )
 }
 
-pub fn set_volume(cfg: &Cfg, level_0_100: u8) -> Res<()> {
-    let lvl = (level_0_100.min(100) as f64) / 100.0;
-    call_service(
-        cfg,
-        "media_player",
-        "volume_set",
-        serde_json::json!({ "volume_level": lvl }),
-    )
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct NowPlaying {
-    pub state: String,
+    pub playing: bool,
     pub title: Option<String>,
     pub artist: Option<String>,
+    /// Текущая секунда трека: media_position плюс время с media_position_updated_at
+    /// (HA обновляет позицию не постоянно).
+    #[serde(rename = "pos")]
     pub position_s: Option<f64>,
-    pub playing: bool,
 }
 
-/// GET /api/states/<entity> — состояние плеера колонки в MA/HA.
+/// Состояние плеера колонки одним шаблоном HA (вместо /api/states + отдельного шаблона позиции).
 pub fn now_playing(cfg: &Cfg) -> Res<NowPlaying> {
-    let url = format!("{}/api/states/{}", cfg.url, cfg.entity);
-    let resp = match agent()
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.token))
-        .call()
-    {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            return Err(format!("HA state: HTTP {code} {}", body.trim()));
-        }
-        Err(e) => return Err(format!("HA state: {e}")),
-    };
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("HA state parse: {e}"))?;
-    let state = v["state"].as_str().unwrap_or("").to_string();
-    let attr = &v["attributes"];
-    let str_attr = |k: &str| attr[k].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-    Ok(NowPlaying {
-        playing: state == "playing",
-        title: str_attr("media_title"),
-        artist: str_attr("media_artist"),
-        position_s: attr["media_position"].as_f64(),
-        state,
-    })
+    let e = &cfg.entity;
+    let tpl = format!(
+        "{{% set e = '{e}' %}}\
+         {{% set u = state_attr(e, 'media_position_updated_at') %}}\
+         {{% set p = state_attr(e, 'media_position') %}}\
+         {{{{ {{'playing': is_state(e, 'playing'), \
+              'title': state_attr(e, 'media_title') or none, \
+              'artist': state_attr(e, 'media_artist') or none, \
+              'pos': none if p is none else p + ((now() - u).total_seconds() \
+                     if u is not none and is_state(e, 'playing') else 0)}} | tojson }}}}"
+    );
+    let s = template(cfg, &tpl).map_err(|e| format!("HA state: {e}"))?;
+    serde_json::from_str(&s).map_err(|e| format!("HA state parse: {e}: {s}"))
 }
 
 /// Фраза для ответа Алисе «что играет».
 pub fn what_playing_phrase(cfg: &Cfg) -> String {
     match now_playing(cfg) {
-        Ok(np) if np.title.is_some() => match (&np.title, &np.artist) {
-            (Some(t), Some(a)) => format!("{a} — {t}"),
-            (Some(t), None) => t.clone(),
-            _ => "Сейчас ничего не играет".into(),
-        },
+        Ok(NowPlaying { title: Some(t), artist: Some(a), .. }) => format!("{a} — {t}"),
+        Ok(NowPlaying { title: Some(t), .. }) => t,
         Ok(_) => "Сейчас ничего не играет".into(),
         Err(_) => "Не удалось узнать, что играет".into(),
     }
