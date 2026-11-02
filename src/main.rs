@@ -1660,6 +1660,27 @@ impl Controller {
                         self.ma_intent(intent);
                     } else {
                         self.shared.set_ma_active(false);
+                        // Запуск SoundCloud — остановить Music Assistant, чтобы не играли оба
+                        // (зеркально ma_intent, который глушит SoundCloud).
+                        let sc_play = matches!(
+                            intent,
+                            Intent::Play(_)
+                                | Intent::Album(_)
+                                | Intent::Playlist(_)
+                                | Intent::MyPlaylist(_)
+                                | Intent::Likes
+                                | Intent::Shuffled(_)
+                                | Intent::Default
+                                | Intent::Recommend
+                                | Intent::Similar
+                        );
+                        if let Some(cfg) = sc_play.then(|| ma::Cfg::from_settings(&self.settings)).flatten() {
+                            thread::spawn(move || {
+                                if let Err(e) = ma::pause(&cfg) {
+                                    eprintln!("ma: не остановил MA перед SoundCloud: {e}");
+                                }
+                            });
+                        }
                         self.intent(intent, None);
                     }
                 }
@@ -2108,7 +2129,9 @@ fn daemon() {
         // после переустановки моста (иначе до первого запроса через мост они уходили Алисе).
         let watch = shared.clone();
         thread::spawn(move || loop {
-            if watch.ma_enabled() && !watch.ma_active() && ma::now_playing(&cfg).is_ok_and(|np| np.playing) {
+            // Пока играет SoundCloud моста, MA активным не делаем: иначе «пауза» уйдёт мимо него.
+            let sc_playing = watch.playing.load(Ordering::Acquire);
+            if watch.ma_enabled() && !watch.ma_active() && !sc_playing && ma::now_playing(&cfg).is_ok_and(|np| np.playing) {
                 eprintln!("ma: играет MA — источник MA");
                 watch.set_ma_active(true);
             }

@@ -1280,11 +1280,12 @@ fn read_frames(
             );
             // «Дальше / назад» — всегда в MA, если не играет SoundCloud моста (просьба 02.11: после
             // переустановки моста ma_active сброшен, и «дальше» уходило Алисе).
-            let skip = matches!(intent, Intent::Next | Intent::Previous)
-                && !shared.playing.load(std::sync::atomic::Ordering::Acquire);
+            let skip = matches!(intent, Intent::Next | Intent::Previous) && !playing;
+            // Играет SoundCloud моста — пауза/стоп/что играет про него, даже если MA помечен активным
+            // (02.11: «включи кино в саундклауде» → «пауза» ушла в MA, SoundCloud не остановить).
             let to_ma = music
                 && shared.ma_enabled()
-                && if play_like { !named_sc } else { shared.ma_active() || skip };
+                && if play_like { !named_sc } else { (shared.ma_active() && !playing) || skip };
             // SoundCloud выключен в настройках: музыку отдаём Алисе — но не если её
             // перехватывает MA.
             if music && !to_ma && !shared.soundcloud() {
