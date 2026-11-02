@@ -31,7 +31,7 @@ const APPS: &[(&[&str], &[&str])] = &[
     (&["настройки", "параметры"], &["com.android.tv.settings", "settings"]),
     (&["гугл плей", "плей маркет", "плеймаркет", "магазин"], &["com.android.vending"]),
     (&["лампа", "lampa"], &["lampa"]),
-    (&["кинопаб", "kinopub"], &["kinopub"]),
+    (&["пубер", "puber", "кинопаб", "кинопуб"], &["com.kino.puber", "puber", "kinopub"]),
     (&["видеобокс", "hd videobox"], &["videobox"]),
 ];
 
@@ -141,6 +141,14 @@ pub fn run(host: &str, dir: &Path, action: &TvAction) -> Result<String, String> 
                 sh(&format!("am start -a android.search.action.GLOBAL_SEARCH --es query {}", adb::quote(q)))?;
             }
             Ok(format!("Ищу на ютубе {q}"))
+        }
+        TvAction::Puber(q) => {
+            let url = format!("puber://search?q={}", percent_encode(q));
+            let out = sh(&format!("am start -a android.intent.action.VIEW -d {}", adb::quote(&url)))?;
+            if out.contains("Error") || out.contains("No activities") || out.contains("Exception") {
+                return Err(format!("Не удалось открыть поиск в кинопабе: {}", out.trim().replace('\n', " ")));
+            }
+            Ok(format!("Ищу в кинопабе {q}"))
         }
         TvAction::Open(name) => {
             let list = sh("pm list packages")?;

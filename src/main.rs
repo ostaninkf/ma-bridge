@@ -13,6 +13,7 @@ mod fsx;
 mod history;
 mod led;
 mod luna;
+mod local;
 mod ma;
 mod mdns;
 mod pc;
@@ -218,6 +219,21 @@ struct Controller {
 
 fn fmt_ms(ms: u64) -> String {
     format!("{}:{:02}", ms / 60_000, ms / 1000 % 60)
+}
+
+/// «Включи X» через Music Assistant — только из локальной библиотеки: точное
+/// совпадение молча; похожие песни — с пояснением; ничего — «Локально не найдено».
+fn play_local_or_say(cfg: &ma::Cfg, q: &str, prefer: Option<local::Kind>) -> ma::Res<()> {
+    match ma::play_local(cfg, q, prefer)? {
+        ma::Local::Exact(_) => {}
+        // Вопрос — и сразу слушаем ответ (без «Алиса»), окно alice::LISTEN_WINDOW.
+        ma::Local::Similar(n) => alice::ask(
+            format!("Точно такого нет. Нашла похожие песни: {n}. Включить их или поискать на Спотифай?"),
+            ma::pending_listening,
+        ),
+        ma::Local::NotFound => alice::say(format!("Локально не найдено: {q}")),
+    }
+    Ok(())
 }
 
 /// Sends the answer to the web page or the command line; for voice commands
@@ -1002,42 +1018,10 @@ impl Controller {
                 | Intent::Recommend
                 | Intent::Similar
                 | Intent::Default
+                | Intent::Answer(alice::Answer::Yes | alice::Answer::Spotify)
         );
-        if is_play && self.shared.playing.load(Ordering::Acquire) {
-            self.set_paused(true);
-        }
-        let r: ma::Res<()> = match intent {
-            Intent::Play(q) => ma::play(&cfg, &q, None, None),
-            Intent::Album(q) => ma::play(&cfg, &q, Some("album"), Some(false)),
-            Intent::Playlist(q) | Intent::MyPlaylist(q) => ma::play(&cfg, &q, Some("playlist"), Some(false)),
-            // «Мои лайки» без запроса: продолжить MA (в MA нет общего «избранного»).
-            Intent::Likes => ma::resume(&cfg),
-            // Генерик «включи музыку»: играет — продолжить; не играет — запустить
-            // бесконечную волну (radio_mode) по последнему треку/исполнителю.
-            Intent::Default => match ma::now_playing(&cfg) {
-                Ok(np) if np.playing => ma::resume(&cfg),
-                Ok(np) => match np.artist.or(np.title) {
-                    Some(seed) => ma::play(&cfg, &seed, Some("artist"), Some(true)),
-                    None => ma::resume(&cfg),
-                },
-                Err(e) => Err(e),
-            },
-            // «Похожее / рекомендации»: радио по текущему исполнителю (или треку).
-            Intent::Recommend | Intent::Similar => match ma::now_playing(&cfg) {
-                Ok(np) => match np.artist.or(np.title) {
-                    Some(seed) => ma::play(&cfg, &seed, Some("artist"), Some(true)),
-                    None => ma::resume(&cfg),
-                },
-                Err(e) => Err(e),
-            },
-            Intent::Pause => ma::pause(&cfg),
-            Intent::Resume => ma::resume(&cfg),
-            Intent::Next => ma::next(&cfg),
-            Intent::Previous => ma::previous(&cfg),
-            Intent::Seek(by) => ma::seek(&cfg, by),
-            Intent::Restart => ma::seek(&cfg, -3_600_000),
-            Intent::Shuffle(on) => ma::set_shuffle(&cfg, on),
-            Intent::Repeat(on) => ma::set_repeat(&cfg, on),
+        // «Что играет» и неподдерживаемое — сразу, без обращения к HA в фоне.
+        match &intent {
             Intent::WhatPlaying => {
                 alice::say(ma::what_playing_phrase(&cfg));
                 return;
@@ -1052,19 +1036,81 @@ impl Controller {
                 eprintln!("ma: {label} не поддерживается в режиме MA");
                 return;
             }
-        };
-        match r {
-            Ok(()) => {
-                if is_play {
-                    self.shared.set_ma_active(true);
-                }
-            }
-            Err(e) => eprintln!("ma: ошибка {label}: {e}"),
+            _ => {}
         }
+        // Старт воспроизведения в MA — заглушить SoundCloud, если он играл.
+        if is_play && self.shared.playing.load(Ordering::Acquire) {
+            self.set_paused(true);
+        }
+        // Оптимистично помечаем MA активным источником: следующая команда
+        // транспорта («стоп», «дальше») сразу уйдёт в MA, не дожидаясь ответа HA.
+        if is_play {
+            self.shared.set_ma_active(true);
+        }
+        // Вызов HA может длиться десятки секунд (MA собирает диджей-волну и держит
+        // HTTP-ответ до конца). Выполняем его в отдельном потоке, чтобы цикл команд
+        // оставался отзывчивым — «стоп»/«дальше» не ждут окончания.
+        thread::spawn(move || {
+            let r: ma::Res<()> = match intent {
+                // Явный «включи X» / «альбом X» / «плейлист X» — ТОЛЬКО локальная
+                // библиотека (решение 02.11, режим тестирования поиска). Не нашли —
+                // ничего не запускаем, Алиса говорит «Локально не найдено».
+                Intent::Play(q) => play_local_or_say(&cfg, &q, None),
+                Intent::Album(q) => play_local_or_say(&cfg, &q, Some(local::Kind::Album)),
+                Intent::Playlist(q) | Intent::MyPlaylist(q) => {
+                    play_local_or_say(&cfg, &q, Some(local::Kind::Playlist))
+                }
+                // «Мои лайки» без запроса: продолжить MA (в MA нет общего «избранного»).
+                Intent::Likes => ma::resume(&cfg),
+                // Генерик «включи музыку»: НИКОГДА не запускает диджей-волну.
+                // Уже играет — ничего; иначе просто продолжить очередь (resume).
+                // Диджей — только по явному «включи что-нибудь/похожее» (Recommend).
+                Intent::Default => match ma::now_playing(&cfg) {
+                    Ok(np) if np.playing => Ok(()),
+                    Ok(_) => ma::resume(&cfg),
+                    Err(e) => Err(e),
+                },
+                // «Похожее / рекомендации»: диджей-волна по текущему исполнителю (или треку).
+                Intent::Recommend | Intent::Similar => match ma::now_playing(&cfg) {
+                    Ok(np) => match np.artist.or(np.title) {
+                        Some(seed) => ma::play(&cfg, &seed, Some("artist"), Some(true)),
+                        None => ma::resume(&cfg),
+                    },
+                    Err(e) => Err(e),
+                },
+                Intent::Answer(a) => ma::answer_similar(&cfg, a),
+                Intent::Pause => ma::pause(&cfg),
+                Intent::Resume => ma::resume(&cfg),
+                Intent::Next => ma::next(&cfg),
+                Intent::Previous => ma::previous(&cfg),
+                Intent::Seek(by) => ma::seek(&cfg, by),
+                Intent::Restart => ma::seek(&cfg, -3_600_000),
+                Intent::Shuffle(on) => ma::set_shuffle(&cfg, on),
+                Intent::Repeat(on) => ma::set_repeat(&cfg, on),
+                // Обработано выше (inline) — сюда не попадают.
+                Intent::WhatPlaying
+                | Intent::Like
+                | Intent::Unlike
+                | Intent::AddToPlaylist(_)
+                | Intent::ToAlice
+                | Intent::Pc(_)
+                | Intent::Tv(_)
+                | Intent::Shuffled(_) => return,
+            };
+            if let Err(e) = r {
+                // ВАЖНО: ma::play_media у HA часто «таймаутит» (десятки секунд не
+                // отдаёт ответ), хотя музыка при этом СТАРТУЕТ. Поэтому ошибку НЕ
+                // считаем провалом и НЕ снимаем ma_active — иначе транспорт
+                // («стоп»/«дальше») после фактически игравшей команды уходит мимо MA.
+                eprintln!("ma: {label}: {e} (музыка могла запуститься; источник оставляем MA)");
+            }
+        });
     }
 
     fn intent(&mut self, intent: Intent, reply: Option<Sender<String>>) {
         match intent {
+            // Ответ о похожих бывает только в режиме MA (alice.rs шлёт его с to_ma).
+            Intent::Answer(_) => respond(reply, "OK", None),
             Intent::Likes => {
                 self.asked = Some(("Мои лайки".into(), "likes".into()));
                 self.fetch("лайки".into(), reply, |c| c.likes())
@@ -1075,6 +1121,7 @@ impl Controller {
                 self.fetch(name, reply, move |c| my_playlist(c, &n));
             }
             Intent::Play(q) => {
+                let q = alice::music_query(&q).to_owned();
                 self.asked = Some((format!("Поиск «{q}»"), format!("play {q}")));
                 let query = q.clone();
                 self.fetch(q, reply, move |c| c.search_tracks(&query));
@@ -1280,6 +1327,11 @@ impl Controller {
                 let l = link.clone();
                 self.fetch(format!("ссылку «{name}»"), Some(reply), move |c| c.resolve(&l));
             }
+            // Диагностика локального поиска MA: только ищет, ничего не запускает.
+            "find" if !arg.is_empty() => match ma::Cfg::from_settings(&self.settings) {
+                Some(cfg) => respond(Some(reply), &ma::find_local_text(&cfg, &arg), None),
+                None => respond(Some(reply), "ERR Music Assistant не настроен", None),
+            },
             "play" if !arg.is_empty() => self.intent(Intent::Play(arg), Some(reply)),
             "play" | "resume" => self.intent(Intent::Resume, Some(reply)),
             "playlist" if !arg.is_empty() => self.intent(Intent::Playlist(arg), Some(reply)),
@@ -2031,6 +2083,10 @@ fn daemon() {
         settings.keyword_only,
         if settings.proxy.is_empty() { "none".into() } else { settings.masked_proxy() }
     );
+    // Локальный индекс библиотеки MA — сразу, чтобы первое «включи X» не ждало.
+    if let Some(cfg) = ma::Cfg::from_settings(&settings) {
+        ma::refresh_local(cfg);
+    }
     Controller {
         client: client_with(&settings),
         shared,

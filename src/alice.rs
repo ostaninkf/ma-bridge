@@ -18,8 +18,40 @@ use crate::{Cmd, Shared};
 pub const ADDRESS: &str = "127.0.0.1:9875";
 const MAX_FRAME: usize = 512 * 1024;
 
+/// Ответ на вопрос «Включить похожие или поискать на Спотифай?».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// «Алиса, включай / да / похожие»
+    Yes,
+    /// «Алиса, на Спотифай / ищи на Спотифай»
+    Spotify,
+    /// «Алиса, нет / не надо»
+    No,
+}
+
+/// Ответ на вопрос о похожих — только пока вопрос открыт (см. ma::pending_active).
+pub fn answer(text: &str) -> Option<Answer> {
+    let (t, _) = strip_service(&normalize(text));
+    let t = t.replace([',', '.', '!', '?'], " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = t.as_str();
+    if t.contains("спотиф") || t.contains("spotify") || t.contains("спотифай") {
+        return Some(Answer::Spotify);
+    }
+    match t {
+        "да" | "давай" | "включай" | "включи" | "включи их" | "включи похожие" | "похожие"
+        | "давай похожие" | "да включи" | "да включай" | "играй" | "ставь" | "поставь" | "да давай"
+        | "включай похожие" | "поставь похожие" => Some(Answer::Yes),
+        "нет" | "не надо" | "не нужно" | "отмена" | "ничего" | "нет не надо" | "не включай" => {
+            Some(Answer::No)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
+    /// Ответ на вопрос о похожих песнях.
+    Answer(Answer),
     Play(String),
     Playlist(String),
     /// «Включи альбом …»: a SoundCloud album (falls back to a playlist).
@@ -73,6 +105,8 @@ pub enum TvAction {
     Search(String),
     /// Search YouTube: «включи на ютубе котиков на проекторе».
     YouTube(String),
+    /// Search inside Puber (kino.pub): «найди в пубере дюну на телевизоре».
+    Puber(String),
     /// Remote-control keys: the Android key code and how many presses.
     Key(&'static str, u8),
     /// Connection check from the settings page.
@@ -135,13 +169,25 @@ fn tv(text: &str) -> Option<TvAction> {
         _ => {}
     }
     let youtube = |w: &str| w.starts_with("ютуб") || w.starts_with("youtube") || w.starts_with("ютьюб");
-    // «найди на ютубе котиков», «включи на ютубе …»
+    let puber = |w: &str| {
+        w.starts_with("пубер") || w.starts_with("puber") || w.starts_with("кинопаб") || w.starts_with("кинопуб")
+    };
+    // «найди на ютубе котиков», «включи на ютубе …», «найди в пубере дюну»
     if matches!(first, "найди" | "поищи" | "включи" | "поставь" | "открой" | "запусти") {
-        let mut i = 1;
+        let i = 1;
         if matches!(words.get(i), Some(&"на") | Some(&"в")) && words.get(i + 1).is_some_and(|w| youtube(w)) {
-            i += 2;
-            let q = after(i);
+            let q = after(i + 2);
             return Some(if q.is_empty() { TvAction::Open("ютуб".into()) } else { TvAction::YouTube(q) });
+        }
+        if matches!(words.get(i), Some(&"на") | Some(&"в")) && words.get(i + 1).is_some_and(|w| puber(w)) {
+            let mut q = after(i + 2);
+            for noun in ["фильм ", "сериал ", "мультфильм ", "мультик ", "кино ", "фильмы ", "сериалы "] {
+                if let Some(r) = q.strip_prefix(noun) {
+                    q = r.to_owned();
+                    break;
+                }
+            }
+            return Some(if q.is_empty() { TvAction::Open("пубер".into()) } else { TvAction::Puber(q) });
         }
     }
     match first {
@@ -672,7 +718,16 @@ fn recommend_phrase(q: &str) -> bool {
         "спокойн", "бодр", "расслабляющ", "фонов", "любим", "нормальн", "кайфов", "топов",
     ];
     let w = desc.trim().split_whitespace().last().unwrap_or("");
-    ADJ.iter().any(|a| w.starts_with(a))
+    if ADJ.iter().any(|a| w.starts_with(a)) {
+        return true;
+    }
+    // Неопределённое: «какую-нибудь / какой-нибудь / любую / какую-то музыку»
+    // (Алиса пишет «нибудь» и без дефиса). Жанры сюда не попадают.
+    const INDEF: [&str; 8] = [
+        "нибудь", "любую", "любой", "любые", "какую", "какой", "каких", "какие",
+    ];
+    desc.split_whitespace()
+        .any(|wd| INDEF.iter().any(|i| wd.contains(i)))
 }
 
 fn intent_core(text: &str, keyword_only: bool) -> Option<Intent> {
@@ -728,9 +783,7 @@ fn intent_core(text: &str, keyword_only: bool) -> Option<Intent> {
             return (!q.is_empty()).then(|| Intent::Playlist(q.to_owned()));
         }
     }
-    let explicit = ["песню ", "трек ", "музыку ", "группу ", "исполнителя ", "микс "]
-        .iter()
-        .find_map(|p| rest.strip_prefix(p));
+    let explicit = MUSIC_PREFIXES.iter().find_map(|p| rest.strip_prefix(p));
     let query = explicit.unwrap_or(rest).trim().trim_matches('"').trim();
     if query.is_empty() || query.len() > 400 {
         return None;
@@ -750,7 +803,18 @@ fn intent_core(text: &str, keyword_only: bool) -> Option<Intent> {
     if recommend_phrase(query) {
         return Some(Intent::Recommend);
     }
-    Some(Intent::Play(query.to_owned()))
+    // Фраза целиком, со словом «песню/группу/…»: локальный поиск MA берёт из него
+    // подсказку типа и не теряет «группу» из «Группы крови». SoundCloud отрезает
+    // его сам (music_query).
+    Some(Intent::Play(rest.trim().trim_matches('"').trim().to_owned()))
+}
+
+/// Слова перед названием в «включи песню X», «включи группу X»…
+const MUSIC_PREFIXES: [&str; 6] = ["песню ", "трек ", "музыку ", "группу ", "исполнителя ", "микс "];
+
+/// Запрос без слова-подсказки — для поиска SoundCloud.
+pub fn music_query(q: &str) -> &str {
+    MUSIC_PREFIXES.iter().find_map(|p| q.strip_prefix(p)).unwrap_or(q).trim().trim_matches('"').trim()
 }
 
 /// «Включи радио», «поставь сказку», «включи яндекс музыку»: Alice starts
@@ -941,15 +1005,82 @@ pub fn cancel_alice() {
     let _ = send_native(&rpc("AliceCapability", 8, &[8, 3]));
 }
 
+/// Давит собственный ответ Алисы («нужна подписка…») первые `secs` секунд после
+/// того, как мы забрали музыкальную фразу себе. Воспроизведение через Music
+/// Assistant стартует с задержкой (HA + сборка волны), и за это время Алиса
+/// успевает проговорить ответ. Детект по состоянию его пропускает, поэтому
+/// просто шлём cancel пачкой — он гасит диалог Алисы, но не медиаплеер MA.
+pub fn hush_alice(secs: u64) {
+    thread::spawn(move || {
+        let until = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < until {
+            // Пока наша фраза ждёт очереди или звучит — не гасить (иначе срежем её).
+            if !OWN_SPEECH.load(std::sync::atomic::Ordering::Acquire)
+                && SAY_PENDING.load(std::sync::atomic::Ordering::Acquire) == 0
+                && !listening()
+            {
+                cancel_alice();
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+/// Сколько фраз `say` ждут или звучат: глушилка на это время замолкает.
+static SAY_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Says `text` in Alice's voice (START_VOCALIZE, as in yandex-station-extended's alice-say.py).
-/// Runs a moment later so it is not swallowed by the cancel of the user's own request.
+/// Runs a moment later so it is not swallowed by the cancel of the user's own request;
+/// right before speaking, Alice's own answer is cancelled once.
 pub fn say(text: String) {
+    SAY_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(600));
+        cancel_alice();
+        thread::sleep(Duration::from_millis(150));
         match speak(&text) {
             Ok(()) => eprintln!("say: {text:?}"),
             Err(e) => eprintln!("say: {text:?}: {e}"),
         }
+        SAY_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    });
+}
+
+/// Сколько колонка слушает ответ на наш вопрос (просьба пользователя: 10 с).
+pub const LISTEN_WINDOW: Duration = Duration::from_secs(10);
+/// До какого момента колонка слушает ответ: глушилка в это время молчит
+/// (её cancel = STOP_CONVERSATION оборвал бы прослушивание).
+static LISTEN_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn listening() -> bool {
+    LISTEN_UNTIL.lock().unwrap().is_some_and(|t| std::time::Instant::now() < t)
+}
+
+/// Ответ получен — окно прослушивания закрыто, глушилка снова работает.
+pub fn stop_listening() {
+    *LISTEN_UNTIL.lock().unwrap() = None;
+}
+
+/// Задаёт вопрос голосом Алисы и сразу после него открывает микрофон
+/// (AliceCapability method 2 = startConversation, номер из прошивки maind,
+/// LOG.md 02.11): ответить можно без «Алиса». `after` — когда начали слушать.
+pub fn ask(text: String, after: impl FnOnce() + Send + 'static) {
+    SAY_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(600));
+        cancel_alice();
+        thread::sleep(Duration::from_millis(150));
+        match speak(&text) {
+            Ok(()) => eprintln!("ask: {text:?}"),
+            Err(e) => eprintln!("ask: {text:?}: {e}"),
+        }
+        *LISTEN_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + LISTEN_WINDOW);
+        SAY_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        match send_native(&rpc("AliceCapability", 8, &[8, 2])) {
+            Ok(()) => eprintln!("ask: слушаю ответ {} с", LISTEN_WINDOW.as_secs()),
+            Err(e) => eprintln!("ask: не открыл микрофон: {e}"),
+        }
+        after();
     });
 }
 
@@ -991,10 +1122,18 @@ fn speak(text: &str) -> io::Result<()> {
         }
         data.resize(size, 0);
         socket.read_exact(&mut data)?;
-        if number(&data, 253) != Some(3) {
+        // События речи: 253=3 (Plum) или 253=210 с «AliceCapability» в поле 7 (новые прошивки,
+        // в т.ч. наша Мини 2 — см. alice-say.py). Раньше ловили только 3 → ждали 15 с до таймаута.
+        let remote = bytes(&data, 252);
+        let ours = match number(&data, 253) {
+            Some(3) => true,
+            Some(210) => remote.and_then(|r| bytes(r, 7)) == Some(b"AliceCapability".as_slice()),
+            _ => false,
+        };
+        if !ours {
             continue;
         }
-        let Some(event) = bytes(&data, 252).and_then(|r| bytes(r, 18)) else {
+        let Some(event) = remote.and_then(|r| bytes(r, 18)) else {
             continue;
         };
         match number(event, 1) {
@@ -1066,6 +1205,7 @@ fn read_frames(
         if alice_state(&data) == Some(2)
             && (suppress_until.is_some_and(|t| std::time::Instant::now() < t) || quiet())
             && !OWN_SPEECH.load(std::sync::atomic::Ordering::Acquire)
+            && !listening()
             && last_cancel.elapsed() > Duration::from_millis(400)
         {
             eprintln!("voice: cutting off Alice's own answer");
@@ -1081,6 +1221,21 @@ fn read_frames(
                 seen.pop_front();
             }
             crate::volume::heard(&text);
+            // ma-bridge: открыт вопрос «включить похожие или искать на Спотифай?» —
+            // короткий ответ («да», «на спотифай», «нет») наш, пока вопрос не истёк.
+            if shared.ma_enabled() && crate::ma::pending_active() {
+                if let Some(a) = answer(&text) {
+                    eprintln!("voice: {text:?} -> ответ о похожих: {a:?} (MA)");
+                    stop_listening();
+                    // Ответ Алисы срезаем всегда: на «включай» она сама включит Яндекс
+                    // («нужна подписка»), на «нет» — никаких её комментариев (решение 02.11).
+                    cancel_alice();
+                    hush_alice(4);
+                    suppress_until = Some(std::time::Instant::now() + Duration::from_secs(10));
+                    let _ = tx.send(Cmd::Voice(Intent::Answer(a), true));
+                    continue;
+                }
+            }
             // ma-bridge: при включённом MA не применяем keyword_only — музыку без
             // слова «саундклауд» перехватываем и шлём в Music Assistant.
             let ko = shared.keyword_only() && !shared.ma_enabled();
@@ -1163,7 +1318,13 @@ fn read_frames(
             }
             eprintln!("voice: {text:?} -> {intent:?} ({})", if to_ma { "MA" } else { "SoundCloud" });
             cancel_alice();
-            suppress_until = Some(std::time::Instant::now() + Duration::from_secs(6));
+            // MA стартует с задержкой — Алиса за это время успевает сказать
+            // «нужна подписка». SoundCloud такого окна не даёт (играет сразу),
+            // поэтому пачку cancel шлём именно для MA.
+            if to_ma {
+                hush_alice(4);
+            }
+            suppress_until = Some(std::time::Instant::now() + Duration::from_secs(if to_ma { 10 } else { 6 }));
             let _ = tx.send(Cmd::Voice(intent, to_ma));
         }
         if data.capacity() > 64 * 1024 {
@@ -1292,9 +1453,22 @@ mod tests {
         assert_eq!(t("сделай громче на телевизоре"), Some(TvAction::Key("KEYCODE_VOLUME_UP", 3)));
         assert_eq!(t("перемотай вперед на проекторе"), Some(TvAction::Key("KEYCODE_MEDIA_FAST_FORWARD", 1)));
         assert_eq!(t("включи сериал друзья на проекторе"), Some(TvAction::Search("друзья".into())));
+        assert_eq!(t("найди в пубере дюну на телевизоре"), Some(TvAction::Puber("дюну".into())));
+        assert_eq!(t("поищи в кинопабе фильм дюна на телевизоре"), Some(TvAction::Puber("дюна".into())));
+        assert_eq!(t("открой пубер на телевизоре"), Some(TvAction::Open("пубер".into())));
         // Without the TV named: not a TV command.
         assert_eq!(t("включи bonobo"), None);
         assert_eq!(t("открой ютуб"), None);
+    }
+
+    #[test]
+    fn answers_about_similar_songs() {
+        assert_eq!(answer("Алиса, включай"), Some(Answer::Yes));
+        assert_eq!(answer("да"), Some(Answer::Yes));
+        assert_eq!(answer("Алиса, ищи на спотифай"), Some(Answer::Spotify));
+        assert_eq!(answer("найди в Spotify"), Some(Answer::Spotify));
+        assert_eq!(answer("нет, не надо"), Some(Answer::No));
+        assert_eq!(answer("включи кино"), None);
     }
 
     #[test]
@@ -1305,7 +1479,7 @@ mod tests {
         );
         assert_eq!(
             intent("Алиса, включи песню Всё идёт по плану", false),
-            Some(Intent::Play("все идет по плану".into()))
+            Some(Intent::Play("песню все идет по плану".into()))
         );
         assert_eq!(
             intent("включи bonobo в саундклауде", true),
