@@ -396,6 +396,7 @@ pub fn answer_similar(cfg: &Cfg, a: crate::alice::Answer) -> Res<()> {
     match a {
         Answer::Yes => {
             eprintln!("ma: «{}» → включаю похожие ({})", p.query, p.uris.len());
+            request_no_repeat(cfg);
             call_service(
                 cfg,
                 "music_assistant",
@@ -455,6 +456,7 @@ fn play_spotify(cfg: &Cfg, query: &str) -> Res<bool> {
     };
     let (mtype, uri, name) = (hit.item.kind.media_type(), hit.item.uri.clone(), hit.item.name.clone());
     eprintln!("ma: «{query}» → Spotify {mtype} «{name}» {uri} [{:.1}]", hit.score);
+    request_no_repeat(cfg);
     call_service(
         cfg,
         "music_assistant",
@@ -462,6 +464,18 @@ fn play_spotify(cfg: &Cfg, query: &str) -> Res<bool> {
         serde_json::json!({ "media_id": uri, "media_type": mtype, "radio_mode": false }),
     )?;
     Ok(true)
+}
+
+/// Запрос голосом играет один раз, без повтора: доиграл — HA возвращает эфир диджея
+/// (автоматизация dj_after_request, решение 02.11). Ошибку только пишем в журнал.
+fn request_no_repeat(cfg: &Cfg) {
+    if let Err(e) = set_repeat_off(cfg) {
+        eprintln!("ma: не выключил повтор очереди: {e}");
+    }
+}
+
+fn set_repeat_off(cfg: &Cfg) -> Res<()> {
+    call_service(cfg, "media_player", "repeat_set", serde_json::json!({ "repeat": "off" }))
 }
 
 /// «Включи X» — ТОЛЬКО локальная библиотека: точное совпадение, иначе похожие
@@ -476,6 +490,7 @@ pub fn play_local(cfg: &Cfg, query: &str, prefer: Option<local::Kind>) -> Res<Lo
     if let Some((item, score)) = hit {
         let mtype = item.kind.media_type();
         eprintln!("ma: «{query}» → локально {mtype} «{}» {} [{score:.1}]", item.name, item.uri);
+        request_no_repeat(cfg);
         call_service(
             cfg,
             "music_assistant",
@@ -517,6 +532,78 @@ pub fn play(cfg: &Cfg, query: &str, media_type: Option<&str>, radio: Option<bool
 
 pub fn pause(cfg: &Cfg) -> Res<()> {
     call_service(cfg, "media_player", "media_pause", serde_json::json!({}))
+}
+
+/// Где поставили на паузу: название трека и секунда. MA на кухне играет «flow»-потоком:
+/// пауза = остановка потока, и если во время паузы Алиса что-то сказала, MA продолжает
+/// трек с 0:00 (02.11: «К чему нам быть на ты» с 1,5 мин → с начала). Место помним сами.
+static PAUSED_AT: Mutex<Option<(String, f64)>> = Mutex::new(None);
+
+/// Текущая секунда трека: media_position + время с media_position_updated_at (HA обновляет
+/// позицию не постоянно).
+fn position_now(cfg: &Cfg) -> Option<f64> {
+    let e = &cfg.entity;
+    let tpl = format!(
+        "{{% set u = state_attr('{e}', 'media_position_updated_at') %}}\
+         {{{{ (state_attr('{e}', 'media_position') | float(-1)) + \
+         ((now() - u).total_seconds() if u is not none and is_state('{e}', 'playing') else 0) }}}}"
+    );
+    let s = agent()
+        .post(&format!("{}/api/template", cfg.url))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({ "template": tpl }))
+        .ok()?
+        .into_string()
+        .ok()?;
+    s.trim().parse::<f64>().ok().filter(|p| *p >= 0.0)
+}
+
+/// Перемотка на абсолютную секунду текущего трека.
+pub fn seek_to(cfg: &Cfg, pos_s: f64) -> Res<()> {
+    call_service(cfg, "media_player", "media_seek", serde_json::json!({ "seek_position": pos_s.round() }))
+}
+
+/// «Пауза»: запомнить трек и секунду, затем пауза в MA.
+pub fn pause_remember(cfg: &Cfg) -> Res<()> {
+    if let Ok(np) = now_playing(cfg) {
+        if let (true, Some(title), Some(pos)) = (np.playing, np.title, position_now(cfg)) {
+            eprintln!("ma: пауза на «{title}», {pos:.0} с");
+            *PAUSED_AT.lock().unwrap() = Some((title, pos));
+        }
+    }
+    pause(cfg)
+}
+
+/// «Продолжи»: продолжить в MA; если заиграл тот же трек, но не с того места, — перемотать
+/// на запомненную секунду.
+pub fn resume_restore(cfg: &Cfg) -> Res<()> {
+    let saved = PAUSED_AT.lock().unwrap().take();
+    resume(cfg)?;
+    let Some((title, pos)) = saved else { return Ok(()) };
+    if pos < 5.0 {
+        return Ok(());
+    }
+    // MA пересобирает поток — ждём, пока заиграет (до 15 с).
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(500));
+        let Ok(np) = now_playing(cfg) else { continue };
+        if !np.playing {
+            continue;
+        }
+        if np.title.as_deref() != Some(title.as_str()) {
+            eprintln!("ma: продолжить: играет другой трек, место «{title}» не возвращаю");
+            return Ok(());
+        }
+        let cur = position_now(cfg).unwrap_or(0.0);
+        if (cur - pos).abs() > 4.0 {
+            eprintln!("ma: продолжить: MA начал «{title}» с {cur:.0} с, возвращаю на {pos:.0} с");
+            seek_to(cfg, pos)?;
+        }
+        return Ok(());
+    }
+    eprintln!("ma: продолжить: MA не заиграл за 15 с, место не возвращаю");
+    Ok(())
 }
 
 pub fn resume(cfg: &Cfg) -> Res<()> {

@@ -68,6 +68,11 @@ against the known ones: 0 startRequest, 1 cancelDialog, 2 startConversation,
 3 stopConversation, 4 toggleConversation, 5 finishConversationVoiceInput,
 6 cancelDialogAndClearQueue, 14 stopTts, 18 startVocalize, 19 startRecognize.
 
+A voice request plays once: the bridge turns the queue's repeat off before starting it (what
+happens when it ends is up to Home Assistant — e.g. go back to a DJ playlist). "Пауза" remembers
+the track and second; "продолжи" seeks back there if Music Assistant restarts the track from 0:00
+(it does in flow mode when Alice speaks during the pause).
+
 Diagnostics without playing anything: `POST http://<speaker>:8765/api/cmd` with body
 `find <query>` returns what the search would play (`OK …`, `SIMILAR …` or `NOT FOUND …`).
 

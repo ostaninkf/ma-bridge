@@ -1061,26 +1061,26 @@ impl Controller {
                     play_local_or_say(&cfg, &q, Some(local::Kind::Playlist))
                 }
                 // «Мои лайки» без запроса: продолжить MA (в MA нет общего «избранного»).
-                Intent::Likes => ma::resume(&cfg),
+                Intent::Likes => ma::resume_restore(&cfg),
                 // Генерик «включи музыку»: НИКОГДА не запускает диджей-волну.
                 // Уже играет — ничего; иначе просто продолжить очередь (resume).
                 // Диджей — только по явному «включи что-нибудь/похожее» (Recommend).
                 Intent::Default => match ma::now_playing(&cfg) {
                     Ok(np) if np.playing => Ok(()),
-                    Ok(_) => ma::resume(&cfg),
+                    Ok(_) => ma::resume_restore(&cfg),
                     Err(e) => Err(e),
                 },
                 // «Похожее / рекомендации»: диджей-волна по текущему исполнителю (или треку).
                 Intent::Recommend | Intent::Similar => match ma::now_playing(&cfg) {
                     Ok(np) => match np.artist.or(np.title) {
                         Some(seed) => ma::play(&cfg, &seed, Some("artist"), Some(true)),
-                        None => ma::resume(&cfg),
+                        None => ma::resume_restore(&cfg),
                     },
                     Err(e) => Err(e),
                 },
                 Intent::Answer(a) => ma::answer_similar(&cfg, a),
-                Intent::Pause => ma::pause(&cfg),
-                Intent::Resume => ma::resume(&cfg),
+                Intent::Pause => ma::pause_remember(&cfg),
+                Intent::Resume => ma::resume_restore(&cfg),
                 Intent::Next => ma::next(&cfg),
                 Intent::Previous => ma::previous(&cfg),
                 Intent::Seek(by) => ma::seek(&cfg, by),
